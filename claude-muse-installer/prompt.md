@@ -495,19 +495,38 @@ function exitStatus(code, signal) {
   return number ? 128 + number : 143;
 }
 
-// Which signals this process absorbs and which it passes on. The child shares
-// this process group, so anything the terminal generates — Ctrl+C, a hangup —
-// is delivered to both of us by the kernel: forwarding it would hand Claude
-// Code a second copy, and Claude Code reads a second SIGINT as "force quit", so
-// one Ctrl+C would cancel twice. Those are absorbed instead, exactly as on
-// Windows, leaving this process alive to close the proxy after the child exits.
-// SIGTERM is not terminal-generated — it only arrives from an explicit kill
-// aimed at this process — so it is the one signal the child has not already
-// received, and the one worth forwarding.
-function signalPlan(platform = process.platform) {
-  return platform === 'win32'
-    ? { absorb: ['SIGINT', 'SIGBREAK'], forward: [] }
-    : { absorb: ['SIGINT', 'SIGHUP'], forward: ['SIGTERM'] };
+// True when a terminal is attached to any of the three standard streams, which
+// is as close as Node gets to "there is a controlling terminal that could be
+// generating signals for my process group". Any one of them is enough: Ctrl+C
+// goes to the foreground process group of the controlling terminal whatever
+// this process has done with its own file descriptors, so `claude-muse -p x
+// < input` in a terminal still counts.
+function hasTerminal() {
+  return ['stdin', 'stdout', 'stderr'].some(stream => process[stream] && process[stream].isTTY);
+}
+
+// Which signals this process absorbs and which it passes on.
+//
+// The child shares this process group, so with a terminal attached anything the
+// terminal generates — Ctrl+C, a hangup — is delivered to both of us by the
+// kernel. Forwarding would hand Claude Code a second copy, and Claude Code
+// reads a second SIGINT as "force quit", so one Ctrl+C would cancel twice.
+// Those are absorbed instead, exactly as on Windows, leaving this process alive
+// to close the proxy after the child exits.
+//
+// With no terminal anywhere — a supervisor, a CI step, a script — nothing can
+// be generating them for the group, so a signal that arrives was aimed at this
+// pid alone and the child has not seen it. Absorbing it there would leave a
+// cancelled run still running: the launcher declines to die, the child never
+// learns, and the proxy stays up. So they are all forwarded.
+//
+// SIGTERM is never terminal-generated and is forwarded either way, which keeps
+// `kill <pid>` working as the one cancellation that behaves the same in both.
+function signalPlan(platform = process.platform, terminal = hasTerminal()) {
+  if (platform === 'win32') return { absorb: ['SIGINT', 'SIGBREAK'], forward: [] };
+  return terminal
+    ? { absorb: ['SIGINT', 'SIGHUP'], forward: ['SIGTERM'] }
+    : { absorb: [], forward: ['SIGINT', 'SIGHUP', 'SIGTERM'] };
 }
 
 async function main() {
@@ -978,9 +997,11 @@ test('a real claude.exe on PATH wins, and an unreadable shim yields nothing', ()
   assert.equal(resolveClaude(true, empty), null);
 });
 
-test('no terminal signal is forwarded, on either platform', () => {
+test('a signal is absorbed only where the terminal already delivered it', () => {
+  // The terminal flag is always passed here: read from the real process, this
+  // would assert something different under a test runner than under a terminal.
   for (const platform of ['linux', 'darwin', 'win32']) {
-    const plan = signalPlan(platform);
+    const plan = signalPlan(platform, true);
     // Ctrl+C and a hangup reach the whole foreground process group, so the child
     // has them already; forwarding would deliver a second SIGINT, which Claude
     // Code takes as a force quit.
@@ -990,10 +1011,21 @@ test('no terminal signal is forwarded, on either platform', () => {
     assert.ok(plan.absorb.includes('SIGINT'), `${platform} lets SIGINT kill the launcher before the proxy closes`);
     assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
   }
-  // SIGTERM arrives only from a kill aimed at this process, so it is the one the
-  // child has not seen.
-  assert.deepEqual(signalPlan('linux').forward, ['SIGTERM']);
-  assert.deepEqual(signalPlan('win32').forward, []);
+  assert.deepEqual(signalPlan('linux', true).forward, ['SIGTERM']);
+
+  // With no terminal anywhere, nothing can be signalling the group: what
+  // arrives was aimed at this pid alone, so absorbing it would leave a
+  // cancelled run still running.
+  for (const platform of ['linux', 'darwin']) {
+    const plan = signalPlan(platform, false);
+    assert.deepEqual(plan.absorb, [], `${platform} still swallows a signal only this process got`);
+    for (const signal of ['SIGINT', 'SIGHUP', 'SIGTERM']) {
+      assert.ok(plan.forward.includes(signal), `${platform} drops ${signal} instead of passing it on`);
+    }
+  }
+  // Windows has no process groups to reason about, and no way to send one of
+  // these to a single process, so it does not change with the terminal.
+  assert.deepEqual(signalPlan('win32', false), signalPlan('win32', true));
 });
 
 test('PATH order decides, not file extension: an early shim beats a later exe', () => {
