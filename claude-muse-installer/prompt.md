@@ -416,10 +416,16 @@ function targetFromShim(shim) {
 // entry point; both shapes are handled, and neither goes through cmd.exe.
 function resolveClaude(windows = WINDOWS, pathValue = process.env.PATH || '') {
   if (!windows) return { file: 'claude', prefix: [] };
-  const executable = findOnPath(['claude.exe', 'claude.com'], pathValue);
-  if (executable) return { file: executable, prefix: [] };
-  const shim = findOnPath(['claude.cmd', 'claude.ps1'], pathValue);
-  const target = shim && targetFromShim(shim);
+  // One pass over PATH, in PATHEXT order inside each directory, because that is
+  // how the shell picks: the first directory holding any of these wins, so a
+  // claude.cmd early on PATH beats a claude.exe later on it. Scanning for every
+  // executable first and only then for shims would quietly run a different
+  // installation from the one the user's own `claude` runs — and the one whose
+  // version this install just checked.
+  const found = findOnPath(['claude.com', 'claude.exe', 'claude.cmd', 'claude.ps1'], pathValue);
+  if (!found) return null;
+  if (/\.(com|exe)$/i.test(found)) return { file: found, prefix: [] };
+  const target = targetFromShim(found);
   if (!target) return null;
   return /\.[cm]?js$/i.test(target)
     ? { file: process.execPath, prefix: [target] }
@@ -884,6 +890,26 @@ test('no terminal signal is forwarded, on either platform', () => {
   // child has not seen.
   assert.deepEqual(signalPlan('linux').forward, ['SIGTERM']);
   assert.deepEqual(signalPlan('win32').forward, []);
+});
+
+test('PATH order decides, not file extension: an early shim beats a later exe', () => {
+  // Two installations, the npm shim first. The shell would run that one, so the
+  // launcher has to as well — scanning the whole PATH for executables first
+  // would silently start the other one.
+  const first = tempDir();
+  const second = tempDir();
+  // As npm installs it: the shim sits on PATH, the binary it names does not.
+  const shipped = path.join(first, 'node_modules', '@anthropic-ai', 'claude-code', 'claude.exe');
+  fs.mkdirSync(path.dirname(shipped), { recursive: true });
+  fs.writeFileSync(shipped, 'MZ');
+  fs.writeFileSync(path.join(first, 'claude.cmd'), SHIM_HEAD +
+    '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\claude.exe"  %*\r\n');
+  const other = path.join(second, 'claude.exe');
+  fs.writeFileSync(other, 'MZ');
+
+  assert.deepEqual(resolveClaude(true, first + path.delimiter + second), { file: shipped, prefix: [] });
+  // Reverse the order and the other installation wins, for the same reason.
+  assert.deepEqual(resolveClaude(true, second + path.delimiter + first), { file: other, prefix: [] });
 });
 
 test('a killed child reports its own signal, not a blanket 143', () => {
@@ -1385,10 +1411,10 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are seventeen offline tests in total: seven in `adapter.test.cjs` and ten
-in `launcher.test.cjs`. All seventeen must pass on both platforms; four of them
-exercise the Windows program-resolution logic against realistic npm shims and
-run correctly on POSIX as well. Report the count you actually observed.
+There are eighteen offline tests in total: seven in `adapter.test.cjs` and
+eleven in `launcher.test.cjs`. All eighteen must pass on both platforms; five of
+them exercise the Windows program-resolution logic against realistic npm shims
+and run correctly on POSIX as well. Report the count you actually observed.
 
 Then confirm that `claude-muse` resolves as a command in a freshly started
 terminal. If a startup file or the user `Path` was changed, explain how to
@@ -1448,11 +1474,18 @@ claude-muse -p 'Reply with exactly: MUSE WORKS' \
   --no-session-persistence --output-format json
 ```
 
-On Windows, in PowerShell:
+On Windows, in PowerShell. The two empty values are written `'""'`, not `''`,
+and that is not a typo: `claude-muse` is a `.cmd` shim, so PowerShell passes the
+arguments to it the legacy way and drops every empty string on the floor.
+`--setting-sources ''` arrives as a bare `--setting-sources` that then eats the
+next flag as its value, and the smoke test quietly stops testing what it says it
+tests. `'""'` reaches the shim as a quoted empty argument and Node receives the
+empty string. (`--%` would also work, but it ends at the line break, and this
+command does not fit on one line.)
 
 ```powershell
 claude-muse -p 'Reply with exactly: MUSE WORKS' `
-  --safe-mode --setting-sources '' --strict-mcp-config --tools '' `
+  --safe-mode --setting-sources '""' --strict-mcp-config --tools '""' `
   --no-session-persistence --output-format json
 ```
 
