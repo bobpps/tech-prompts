@@ -96,9 +96,11 @@ First inspect the environment:
 6. Check whether `~/.local/bin` is on `PATH`. If it is not, add it idempotently
    and tell me exactly what changed.
 
-   On POSIX, add this exact line to the startup file of the user's login shell —
-   `~/.zshrc` under zsh, which is the default on macOS, `~/.bash_profile` or
-   `~/.bashrc` under bash. Name the file you chose:
+   On POSIX, determine the user's login shell first and write to that shell's
+   startup file, in that shell's own syntax. Name the file you chose.
+
+   Under zsh, the default on macOS, that is `~/.zshrc`; under bash it is
+   `~/.bash_profile` for a login shell, otherwise `~/.bashrc`:
 
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
@@ -108,6 +110,19 @@ First inspect the environment:
    Node-reported home for `$HOME` here — `export PATH="/c/Users/you/.local/bin:$PATH"`
    — never the native `C:\Users\you`, whose colon bash would read as a `PATH`
    separator.
+
+   Under fish, `export` is not valid syntax and the file is
+   `~/.config/fish/config.fish`. `fish_add_path` is idempotent by itself:
+
+   ```fish
+   fish_add_path "$HOME/.local/bin"
+   ```
+
+   Under any other login shell — tcsh, ksh, nushell — write the equivalent in
+   that shell's syntax and say which syntax you used. If you cannot establish
+   it, change nothing, and tell me the exact line to add and the file to add it
+   to; do not silently fall back to `export`, which would leave a startup file
+   that errors on every new terminal.
 
    On Windows, set the user-level `Path` variable. Use this, not `setx`, which
    truncates long values at 1024 characters and expands variables:
@@ -533,6 +548,15 @@ function webSearchTools(body) {
   return body;
 }
 
+// Buffers a non-streaming body chunk by chunk rather than through `.json()` or
+// `.arrayBuffer()`, so the idle timer sees the transfer and a slow but healthy
+// download is not mistaken for a dead connection.
+async function collect(body, active) {
+  const chunks = [];
+  if (body) for await (const chunk of body) { active(); chunks.push(chunk); }
+  return Buffer.concat(chunks);
+}
+
 function sseFrame(frame, names) {
   const lines = frame.split(/\r?\n/);
   const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
@@ -614,9 +638,9 @@ async function startProxy(upstream, token, idleSeconds) {
         if (buffer) res.write(sseFrame(buffer, names) + '\n\n');
         res.end();
       } else if (response.headers.get('content-type')?.includes('json')) {
-        res.end(JSON.stringify(names.response(await response.json())));
+        res.end(JSON.stringify(names.response(JSON.parse((await collect(response.body, active)).toString('utf8')))));
       } else {
-        res.end(Buffer.from(await response.arrayBuffer()));
+        res.end(await collect(response.body, active));
       }
     } catch (error) {
       const refused = error instanceof UnsupportedRequest;
@@ -889,6 +913,16 @@ test('the request timer measures silence, not elapsed time', async () => {
   const upstream = http.createServer(async (req, res) => {
     for await (const chunk of req) void chunk;
     if (req.url.endsWith('/silent')) return;
+    if (req.url.endsWith('/slowjson')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // 200 ms of body that is not parseable JSON until the last piece lands.
+      for (const piece of ['{"type":', '"message"', ',"content"', ':[]', '}']) {
+        await new Promise(resolve => setTimeout(resolve, 40));
+        res.write(piece);
+      }
+      res.end();
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     // Six frames 40 ms apart: 240 ms in total, well past the 150 ms idle limit,
     // with no gap longer than it.
@@ -906,6 +940,10 @@ test('the request timer measures silence, not elapsed time', async () => {
     const streamed = await (await fetch(proxy.url + '/v1/messages', { method: 'POST', headers, body: '{}' })).text();
     assert.equal(streamed.match(/data: /g).length, 6);
     assert.ok(Date.now() - started > 150, 'the stream outlived the idle window');
+    // A non-streaming body is buffered chunk by chunk, so it counts as activity too.
+    const slow = await fetch(proxy.url + '/v1/slowjson', { method: 'POST', headers, body: '{}' });
+    assert.equal(slow.status, 200);
+    assert.deepEqual(await slow.json(), { type: 'message', content: [] });
     // A connection that goes quiet is still abandoned.
     const silent = await fetch(proxy.url + '/v1/silent', { method: 'POST', headers, body: '{}' });
     assert.equal(silent.status, 502);
