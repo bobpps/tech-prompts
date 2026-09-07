@@ -518,38 +518,39 @@ function exitStatus(code, signal) {
   return number ? 128 + number : 143;
 }
 
-// True when a terminal is attached to any of the three standard streams, which
-// is as close as Node gets to "there is a controlling terminal that could be
-// generating signals for my process group". Any one of them is enough: Ctrl+C
-// goes to the foreground process group of the controlling terminal whatever
-// this process has done with its own file descriptors, so `claude-muse -p x
-// < input` in a terminal still counts.
-function hasTerminal() {
-  return ['stdin', 'stdout', 'stderr'].some(stream => process[stream] && process[stream].isTTY);
+// How the child is started. On POSIX it gets its own process group, which is
+// what makes the signal rules below decidable at all: the terminal then
+// delivers Ctrl+C and a hangup to this process only, so exactly one copy
+// reaches Claude Code — the one forwarded below — whether the signal came from
+// the terminal or from a `kill` aimed at this pid. Reading delivery scope off
+// the environment instead is guesswork: nothing in Node says who sent a signal,
+// and an inherited terminal looks identical in both cases.
+//
+// `detached` starts a new session, so the child no longer has this terminal as
+// its controlling terminal. It keeps the inherited descriptors and can still
+// read, write and set raw mode on them: SIGTTIN and SIGTTOU are raised for
+// background groups of the session that owns the terminal, and the child is no
+// longer in that session at all.
+function spawnOptions(platform = process.platform) {
+  return { stdio: 'inherit', detached: platform !== 'win32' };
 }
 
 // Which signals this process absorbs and which it passes on.
 //
-// The child shares this process group, so with a terminal attached anything the
-// terminal generates — Ctrl+C, a hangup — is delivered to both of us by the
-// kernel. Forwarding would hand Claude Code a second copy, and Claude Code
-// reads a second SIGINT as "force quit", so one Ctrl+C would cancel twice.
-// Those are absorbed instead, exactly as on Windows, leaving this process alive
-// to close the proxy after the child exits.
+// On POSIX everything is forwarded, because with the child in its own group
+// nothing else reaches it: absorbing would leave a cancelled run running, with
+// the launcher declining to die, Claude Code never told, and the proxy up.
+// SIGWINCH is in the list for the same reason — a resize goes to the terminal's
+// foreground group, which is now this process, and a TUI that never hears about
+// it stops reflowing.
 //
-// With no terminal anywhere — a supervisor, a CI step, a script — nothing can
-// be generating them for the group, so a signal that arrives was aimed at this
-// pid alone and the child has not seen it. Absorbing it there would leave a
-// cancelled run still running: the launcher declines to die, the child never
-// learns, and the proxy stays up. So they are all forwarded.
-//
-// SIGTERM is never terminal-generated and is forwarded either way, which keeps
-// `kill <pid>` working as the one cancellation that behaves the same in both.
-function signalPlan(platform = process.platform, terminal = hasTerminal()) {
-  if (platform === 'win32') return { absorb: ['SIGINT', 'SIGBREAK'], forward: [] };
-  return terminal
-    ? { absorb: ['SIGINT', 'SIGHUP'], forward: ['SIGTERM'] }
-    : { absorb: [], forward: ['SIGINT', 'SIGHUP', 'SIGTERM'] };
+// Windows has no process groups to arrange and no way to send one of these to a
+// single process; its console delivers Ctrl+C to the child already, so those
+// are absorbed to keep this process alive long enough to close the proxy.
+function signalPlan(platform = process.platform) {
+  return platform === 'win32'
+    ? { absorb: ['SIGINT', 'SIGBREAK'], forward: [] }
+    : { absorb: [], forward: ['SIGINT', 'SIGHUP', 'SIGTERM', 'SIGWINCH'] };
 }
 
 async function main() {
@@ -568,7 +569,7 @@ async function main() {
   env.ANTHROPIC_BASE_URL = proxy.url;
   env.ANTHROPIC_AUTH_TOKEN = proxy.token;
   const args = [...target.prefix, ...claudeArgs(process.argv.slice(2), config.MUSE_EFFORT)];
-  const child = spawn(target.file, args, { env, stdio: 'inherit' });
+  const child = spawn(target.file, args, { env, ...spawnOptions() });
 
   let finished = false;
   const finish = code => {
@@ -587,7 +588,7 @@ async function main() {
 
 module.exports = {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, claudeNames, signalPlan, exitStatus, SCRUB, DEFAULTS,
+  findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, exitStatus, SCRUB, DEFAULTS,
 };
 
 if (require.main === module) {
@@ -872,7 +873,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, claudeNames, signalPlan, exitStatus,
+  findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, exitStatus,
 } = require('./launcher.cjs');
 
 const KEY = 'LLM|1234567890|abcdefg_hijklmn';
@@ -1043,35 +1044,29 @@ test('PATHEXT decides which form wins inside a directory', () => {
   assert.deepEqual(claudeNames('.CMD;.EXE'), ['claude.cmd', 'claude.exe', 'claude.com', 'claude.ps1']);
 });
 
-test('a signal is absorbed only where the terminal already delivered it', () => {
-  // The terminal flag is always passed here: read from the real process, this
-  // would assert something different under a test runner than under a terminal.
-  for (const platform of ['linux', 'darwin', 'win32']) {
-    const plan = signalPlan(platform, true);
-    // Ctrl+C and a hangup reach the whole foreground process group, so the child
-    // has them already; forwarding would deliver a second SIGINT, which Claude
-    // Code takes as a force quit.
-    for (const signal of ['SIGINT', 'SIGHUP', 'SIGBREAK']) {
-      assert.ok(!plan.forward.includes(signal), `${platform} forwards ${signal} the child already got`);
-    }
-    assert.ok(plan.absorb.includes('SIGINT'), `${platform} lets SIGINT kill the launcher before the proxy closes`);
-    assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
-  }
-  assert.deepEqual(signalPlan('linux', true).forward, ['SIGTERM']);
-
-  // With no terminal anywhere, nothing can be signalling the group: what
-  // arrives was aimed at this pid alone, so absorbing it would leave a
-  // cancelled run still running.
+test('the child owns its process group, so every signal is forwarded once', () => {
   for (const platform of ['linux', 'darwin']) {
-    const plan = signalPlan(platform, false);
-    assert.deepEqual(plan.absorb, [], `${platform} still swallows a signal only this process got`);
+    // Its own group is what makes forwarding safe: the terminal delivers to the
+    // launcher alone, so the copy the child gets is the one sent here, and a
+    // signal aimed at this pid arrives the same way.
+    assert.equal(spawnOptions(platform).detached, true, `${platform} leaves the child in this process group`);
+    const plan = signalPlan(platform);
+    assert.deepEqual(plan.absorb, [], `${platform} swallows a signal the child will never see`);
     for (const signal of ['SIGINT', 'SIGHUP', 'SIGTERM']) {
       assert.ok(plan.forward.includes(signal), `${platform} drops ${signal} instead of passing it on`);
     }
+    // A resize now reaches this process rather than the child, so it has to be
+    // passed on or the TUI stops reflowing.
+    assert.ok(plan.forward.includes('SIGWINCH'), `${platform} leaves the child blind to a resize`);
+    assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
   }
-  // Windows has no process groups to reason about, and no way to send one of
-  // these to a single process, so it does not change with the terminal.
-  assert.deepEqual(signalPlan('win32', false), signalPlan('win32', true));
+
+  // Windows has no process groups to arrange and no way to send one of these to
+  // a single process; its console has already given Ctrl+C to the child, so it
+  // is absorbed to keep this process alive until the proxy is closed.
+  assert.equal(spawnOptions('win32').detached, false);
+  assert.deepEqual(signalPlan('win32'), { absorb: ['SIGINT', 'SIGBREAK'], forward: [] });
+  assert.equal(spawnOptions('linux').stdio, 'inherit');
 });
 
 test('PATH order decides, not file extension: an early shim beats a later exe', () => {
