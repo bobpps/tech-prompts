@@ -433,6 +433,26 @@ function buildChildEnv(source, config, windows = WINDOWS) {
   });
 }
 
+// `--muse-debug` turns the adapter's request log on for one run, and
+// `--muse-debug=<path>` says where to write it. The value is joined to the flag
+// rather than taken as the argument after it, because
+// `claude-muse --muse-debug "write a test"` would otherwise swallow the prompt
+// as a filename.
+//
+// The flag is namespaced instead of a plain `--debug`: Claude Code has one of
+// its own, and taking that name here would remove a flag from the program this
+// launcher exists to run. Only this flag is removed; everything else passes
+// through in the order it was given.
+function debugTarget(args, dir = os.tmpdir(), now = Date.now()) {
+  const at = args.findIndex(arg => arg === '--muse-debug' || arg.startsWith('--muse-debug='));
+  if (at === -1) return { args, log: null };
+  const chosen = args[at].slice('--muse-debug='.length);
+  return {
+    args: [...args.slice(0, at), ...args.slice(at + 1)],
+    log: chosen || path.join(dir, 'claude-muse-' + now + '.log'),
+  };
+}
+
 function claudeArgs(args, defaultEffort) {
   if (args.some(arg => arg === '--effort' || arg.startsWith('--effort='))) return args;
   return ['--effort', defaultEffort, ...args];
@@ -599,7 +619,14 @@ async function main() {
   const env = buildChildEnv(process.env, config);
   env.ANTHROPIC_BASE_URL = proxy.url;
   env.ANTHROPIC_AUTH_TOKEN = proxy.token;
-  const args = [...target.prefix, ...claudeArgs(process.argv.slice(2), config.MUSE_EFFORT)];
+  // Read after the child environment is built, so the log stays a property of
+  // this process and Claude Code does not inherit it.
+  const debug = debugTarget(process.argv.slice(2));
+  if (debug.log) {
+    process.env.MUSE_DEBUG_LOG = debug.log;
+    console.error('claude-muse: request log -> ' + debug.log);
+  }
+  const args = [...target.prefix, ...claudeArgs(debug.args, config.MUSE_EFFORT)];
   const child = spawn(target.file, args, { env, ...spawnOptions() });
 
   let finished = false;
@@ -618,7 +645,7 @@ async function main() {
 }
 
 module.exports = {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
+  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan,
   hasControllingTerminal, exitStatus, SCRUB, DEFAULTS,
 };
@@ -637,6 +664,27 @@ Create `~/.local/lib/claude-muse/adapter.cjs` with this exact content:
 const http = require('node:http');
 const { createHash, randomBytes } = require('node:crypto');
 const { once } = require('node:events');
+const fs = require('node:fs');
+
+// Diagnostics, off unless MUSE_DEBUG_LOG names a file.
+//
+// Meta rejects request fields this adapter has not learned about yet, one at a
+// time, and Claude Code reports every one of them the same way: "the model is
+// temporarily unavailable" - a sentence that names neither the request nor the
+// field. Without a record there is nothing to tell that apart from a network
+// failure, an idle timeout, or a fault in this file. This log is how the next
+// unsupported field gets identified instead of guessed at.
+//
+// It records the shape of a request and the text of a failure. Never a header,
+// never the credential, never the content of a message. The path is read on
+// each call, so setting it after this file is loaded still works.
+function debugLog(entry) {
+  const target = process.env.MUSE_DEBUG_LOG;
+  if (!target) return;
+  try {
+    fs.appendFileSync(target, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+  } catch { /* diagnostics must never break a turn */ }
+}
 
 class ToolNames {
   constructor() { this.originals = new Map(); }
@@ -711,12 +759,20 @@ class ToolNames {
 // whole body would silently reduce an MCP schema property of that name to
 // `{"type": ...}`, dropping its own `properties` and `description` on the way
 // through, and the tool would then be described wrongly to the model.
+// FORCE_PROMPT_CACHING_5M pins the provider default at the source, and with
+// that variable set a direct connection never produced the 400 this guards
+// against, so on a good day nothing here fires. It stays anyway. That variable
+// is undocumented; a Claude Code release can rename or drop it without notice,
+// and the failure mode when it does is every request refused. The reductions
+// are counted into the debug log so the day the variable stops working shows
+// up as a log line rather than only as a broken install.
 function plainCacheControl(body) {
   if (!body || typeof body !== 'object') return body;
+  let reduced = 0;
   const reduce = holder => {
     const value = holder && holder.cache_control;
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      for (const extra of Object.keys(value)) if (extra !== 'type') delete value[extra];
+      for (const extra of Object.keys(value)) if (extra !== 'type') { delete value[extra]; reduced++; }
     }
   };
   const blocks = content => {
@@ -730,6 +786,7 @@ function plainCacheControl(body) {
   blocks(body.system);
   if (Array.isArray(body.tools)) for (const tool of body.tools) reduce(tool);
   if (Array.isArray(body.messages)) for (const message of body.messages) blocks(message && message.content);
+  if (reduced) debugLog({ event: 'cache_control_reduced', fields: reduced });
   return body;
 }
 
@@ -766,6 +823,24 @@ function webSearchTools(body) {
   return body;
 }
 
+// Meta rejects `stop_sequences` outright with HTTP 400.
+//
+// Claude Code sends it on the auto-mode safety classifier call - the request
+// that decides whether a tool call may run without stopping to ask. That
+// request carries no tools and does not stream, which is why it is the only
+// place the field appears and why ordinary turns in the same session are
+// unaffected. Claude Code renders the resulting 400 as "the model is
+// temporarily unavailable", so the visible symptom is that every gated tool -
+// Bash, Edit, Agent - fails while reading files keeps working.
+//
+// Dropping the field changes where generation stops, not what it contains: the
+// model may run past the point the caller meant to cut. That is a real cost,
+// and the alternative is a feature that never works at all.
+function stopSequences(body) {
+  if (body && typeof body === 'object') delete body.stop_sequences;
+  return body;
+}
+
 // Buffers a non-streaming body chunk by chunk rather than through `.json()` or
 // `.arrayBuffer()`, so the idle timer sees the transfer and a slow but healthy
 // download is not mistaken for a dead connection.
@@ -793,11 +868,18 @@ async function startProxy(upstream, token, idleSeconds) {
   // which leaves it measuring only genuine silence.
   const idleMs = Number(idleSeconds) > 0 ? Number(idleSeconds) * 1000 : 300000;
   const server = http.createServer(async (req, res) => {
+    // Logged before the checks below, not after. A request this proxy turns
+    // away leaves no other trace, and "no entry at all" is exactly what
+    // distinguishes a client calling somewhere this adapter does not serve
+    // from one whose request reached the provider and was refused there.
+    debugLog({ event: 'incoming', method: req.method, path: req.url.split('?')[0] });
     if (req.headers.authorization !== 'Bearer ' + localToken) {
+      debugLog({ event: 'rejected', reason: 'auth', method: req.method, path: req.url.split('?')[0] });
       res.writeHead(401).end();
       return;
     }
     if (!req.url.startsWith('/v1/') || !['POST', 'GET'].includes(req.method)) {
+      debugLog({ event: 'rejected', reason: 'path', method: req.method, path: req.url.split('?')[0] });
       res.writeHead(404).end();
       return;
     }
@@ -842,11 +924,24 @@ async function startProxy(upstream, token, idleSeconds) {
       const target = new URL(origin);
       target.pathname = origin.pathname.replace(/\/$/, '') + req.url.split('?')[0];
       target.search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+      let payload;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        debugLog({
+          event: 'request', method: req.method, path: req.url.split('?')[0],
+          model: parsed.model, stream: parsed.stream === true, bytes: raw.length,
+          tools: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
+          messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
+          longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
+        });
+        payload = JSON.stringify(stopSequences(plainCacheControl(webSearchTools(names.request(parsed)))));
+      }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
-        body: raw ? JSON.stringify(plainCacheControl(webSearchTools(names.request(JSON.parse(raw))))) : undefined,
+        body: payload,
       });
       active();
+      debugLog({ event: 'response', status: response.status, type: response.headers.get('content-type') });
       res.statusCode = response.status;
       for (const [key, value] of response.headers) {
         if (!['content-length', 'content-encoding', 'transfer-encoding', 'connection'].includes(key)) res.setHeader(key, value);
@@ -868,11 +963,16 @@ async function startProxy(upstream, token, idleSeconds) {
         if (buffer) res.write(sseFrame(buffer, names) + '\n\n');
         res.end();
       } else if (response.headers.get('content-type')?.includes('json')) {
-        res.end(JSON.stringify(names.response(JSON.parse((await collect(response.body, active)).toString('utf8')))));
+        const text = (await collect(response.body, active)).toString('utf8');
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, body: text.slice(0, 2000) });
+        res.end(JSON.stringify(names.response(JSON.parse(text))));
       } else {
-        res.end(await collect(response.body, active));
+        const buffered = await collect(response.body, active);
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, body: buffered.toString('utf8').slice(0, 2000) });
+        res.end(buffered);
       }
     } catch (error) {
+      debugLog({ event: 'adapter_error', name: error && error.name, message: error && error.message });
       const refused = error instanceof UnsupportedRequest;
       if (!res.headersSent) {
         res.writeHead(refused ? 400 : 502, { 'content-type': 'application/json' });
@@ -892,7 +992,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest };
+module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -904,7 +1004,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
+  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, hasControllingTerminal, exitStatus,
 } = require('./launcher.cjs');
 
@@ -1159,6 +1259,26 @@ test('a killed child reports its own signal, not a blanket 143', () => {
   assert.equal(exitStatus(null, 'NOT_A_SIGNAL'), 143);
   assert.equal(exitStatus(null, null), 143);
 });
+
+test('the debug flag is stripped from the arguments and names a log file', () => {
+  const off = debugTarget(['-p', 'hi']);
+  assert.deepEqual(off.args, ['-p', 'hi']);
+  assert.equal(off.log, null);
+  const bare = debugTarget(['-p', 'hi', '--muse-debug'], '/logs', 7);
+  assert.deepEqual(bare.args, ['-p', 'hi']);
+  assert.equal(bare.log, path.join('/logs', 'claude-muse-7.log'));
+  const chosen = debugTarget(['--muse-debug=/logs/chosen.log', '-p', 'hi']);
+  assert.deepEqual(chosen.args, ['-p', 'hi']);
+  assert.equal(chosen.log, '/logs/chosen.log');
+});
+
+test('a bare debug flag never consumes the argument after it', () => {
+  // `claude-muse --muse-debug "write a test"` must still send the prompt to
+  // Claude Code. Reading the path from the next argument would eat it instead.
+  const { args, log } = debugTarget(['--muse-debug', 'write a test'], '/logs', 7);
+  assert.deepEqual(args, ['write a test']);
+  assert.equal(log, path.join('/logs', 'claude-muse-7.log'));
+});
 ```
 
 Create `~/.local/lib/claude-muse/adapter.test.cjs` with this exact content:
@@ -1168,8 +1288,11 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest } = require('./adapter.cjs');
+const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -1244,6 +1367,65 @@ test('HTTP authentication, request mapping, fragmented UTF-8 SSE, and error stat
     assert.equal(error.status, 429);
     assert.equal((await error.json()).error.message, 'rate limited');
   } finally {
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('stop_sequences never reaches the provider', async () => {
+  let received;
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"type":"message"}');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    const response = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', stop_sequences: ['</verdict>'], messages: [{ content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    // Asserted on the body the provider received, not on the helper alone: a
+    // helper that works but is never called is the failure this guards against.
+    assert.equal('stop_sequences' in received, false);
+    assert.deepEqual(received.messages, [{ content: 'hi' }]);
+    assert.equal(received.model, 'm');
+  } finally {
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('the debug log names an upstream failure and never the credential', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end('{"error":{"message":"`stop_sequences` is not supported"}}');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const file = path.join(os.tmpdir(), 'muse-debug-' + process.pid + '.log');
+  fs.rmSync(file, { force: true });
+  process.env.MUSE_DEBUG_LOG = file;
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    const log = fs.readFileSync(file, 'utf8');
+    assert.match(log, /"event":"request"/);
+    assert.match(log, /"event":"upstream_error"/);
+    assert.match(log, /stop_sequences/);
+    assert.equal(log.includes('upstream-test-key'), false);
+  } finally {
+    delete process.env.MUSE_DEBUG_LOG;
+    fs.rmSync(file, { force: true });
     proxy.server.closeAllConnections(); proxy.server.close();
     upstream.closeAllConnections(); upstream.close();
   }
@@ -1469,6 +1651,41 @@ your Claude Code settings, or turn the WebSearch tool off.
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
 
+## Auto mode
+
+Claude Code's auto mode asks the model whether a tool call is safe before
+running it, on a separate request that carries no tools and does not stream.
+That request includes `stop_sequences`, which Meta rejects with HTTP 400, and
+Claude Code renders the refusal as "the model is temporarily unavailable". The
+symptom names nothing useful: Bash, Edit and Agent all fail while reading files
+keeps working, because read-only tools are not gated. The adapter drops the
+field, which costs where generation stops and buys a mode that would otherwise
+never run at all.
+
+## Diagnosing an unsupported field
+
+Meta refuses one field at a time, and most of those refusals reach the user as
+that same "temporarily unavailable" sentence, which names neither the request
+nor the field. `claude-muse --muse-debug` turns on a request log for one run and
+prints the path it is writing to; `--muse-debug=<path>` chooses the file, and
+`MUSE_DEBUG_LOG` in the environment does the same thing for a session that is
+already scripted.
+
+The flag is namespaced rather than plain `--debug` because Claude Code has a
+`--debug` of its own, and taking that name here would remove a flag from the
+program this launcher exists to run. The launcher strips its own flag from the
+arguments; everything else passes through untouched.
+
+Each line of the log is one JSON object: the shape of a request (model, whether
+it streams, how many tools, the longest tool name), the status of the reply, the
+text of any upstream error, and any request the proxy turned away before
+forwarding it. Headers, the key and the content of messages are never written.
+With neither the flag nor the variable, nothing is logged and no file is opened.
+
+Three of the four provider incompatibilities in this document were found this
+way rather than predicted, so reach for the log first when a tool stops working,
+not last.
+
 ## Long turns
 
 The adapter gives up on a request after `MUSE_IDLE_TIMEOUT_SECONDS` of complete
@@ -1622,6 +1839,9 @@ Why the local adapter is required:
   it. During integration tests Muse also generated incorrect `default.`-prefixed
   names and omitted required arguments after deferred loading. Direct schema
   loading was reliable after aliasing.
+- Meta rejects `stop_sequences` with HTTP 400, and Claude Code sends it on the
+  auto-mode safety classifier call. Without the adapter, auto mode cannot judge
+  any gated tool and reports the model as unavailable instead.
 
 Why Claude Code is started the way it is on Windows:
 
@@ -1722,8 +1942,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twenty-three offline tests in total: ten in `adapter.test.cjs` and
-thirteen in `launcher.test.cjs`. All twenty-three must pass on both platforms;
+There are twenty-seven offline tests in total: twelve in `adapter.test.cjs` and
+fifteen in `launcher.test.cjs`. All twenty-seven must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -1774,6 +1994,11 @@ explicitly:
 - `400` mentioning a tool name over 64 characters: verify that Claude Code is
   running through the local adapter and that the alias transformation covers
   the named block.
+- `400` naming any other unsupported field: rerun with `--muse-debug` and read
+  the `upstream_error` line in the log. It names the field.
+- Claude Code reporting the model as temporarily unavailable while read-only
+  tools keep working: that is auto mode's classifier failing, not an outage.
+  Check the log before believing the message.
 
 Then run a cheap Claude Code smoke test with no customizations or tools.
 

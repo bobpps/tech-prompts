@@ -5,7 +5,7 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs twenty-three offline
+detects the platform once and follows only that branch; it writes the files, runs twenty-seven offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
@@ -23,8 +23,8 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/bin/claude-muse.cmd         Windows only, CRLF
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
-~/.local/lib/claude-muse/launcher.test.cjs   thirteen offline tests
-~/.local/lib/claude-muse/adapter.test.cjs    ten offline tests
+~/.local/lib/claude-muse/launcher.test.cjs   fifteen offline tests
+~/.local/lib/claude-muse/adapter.test.cjs    twelve offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
 ~/.config/claude-muse/provider.env   base URL, model, effort, idle timeout — and your key
 ```
@@ -32,9 +32,54 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 The launcher scrubs Anthropic and experimental variables out of the child environment, maps every
 internal model role (Fable, Opus, Sonnet, Haiku, subagents) to the Contributor model ID, and pins
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576` so Claude Code stops assuming a 200,000-token window for
-an unknown model ID. The adapter is a loopback proxy that shortens tool names over Meta's
-64-character limit, reduces `cache_control` to the plain `ephemeral` form Meta accepts, and
-normalises the `web_search` tool definition.
+an unknown model ID. The adapter is a loopback proxy; the next section says what it is for.
+
+## What the adapter is for
+
+Meta's Model API is Anthropic-compatible, and [their own guide][coding-agents] connects Claude Code
+to it with environment variables alone — no proxy. That holds until Claude Code sends a field Meta
+does not accept, and then the request fails outright. Each of these was hit in practice, not
+anticipated:
+
+| What Claude Code sends | What Meta answers | What the adapter does |
+| --- | --- | --- |
+| A tool `name` over 64 characters | `name must be at most 64 characters` | Substitutes a deterministic hashed alias, restores the real name in the reply |
+| `cache_control` carrying `ttl` or `scope` | `cache_control.ttl: 1h is not supported` | Reduces it to the plain `{"type":"ephemeral"}` form |
+| `max_uses` on `web_search_20250305` | `web_search field max_uses is not supported` | Drops the field; the provider applies its own cap |
+| `stop_sequences` on the auto-mode classifier | `stop_sequences is not supported` | Drops the field |
+
+The last row is worth spelling out, because its symptom names nothing. Claude Code reports that
+particular 400 as *"the model is temporarily unavailable"*, so auto mode stops running Bash, Edit
+and Agent while reading files carries on working — which looks like an outage rather than a
+rejected field.
+
+The adapter rewrites protocol metadata only. Tool inputs, tool schemas and message text pass
+through untouched, so a field named `cache_control` inside an MCP tool's own schema stays exactly
+as that tool defined it.
+
+In a typical setup only one MCP tool name crosses 64 characters, which makes the proxy look
+avoidable. It is not: `ENABLE_TOOL_SEARCH=true` changes *when* that definition travels, not
+whether, and one long name fails every request that carries it.
+
+## When something stops working
+
+Meta refuses one unsupported field at a time, and Claude Code renders most of those refusals as the
+same "temporarily unavailable" sentence. Run with `--muse-debug` and the adapter records what it
+sent and what came back, to a file whose path is printed at startup:
+
+```powershell
+claude-muse --muse-debug
+```
+
+Use `--muse-debug=C:\path\to\file.log` to choose the file, or set `MUSE_DEBUG_LOG` in the
+environment for a scripted session. The flag is namespaced because Claude Code has a `--debug` of
+its own; the launcher removes only its own flag and passes everything else through.
+
+One JSON object per line: the shape of a request (model, whether it streams, how many tools, the
+longest tool name), the status of the reply, and the text of any error. Headers, the key and the
+content of messages are never written. Without the flag nothing is logged and no file is opened.
+
+[coding-agents]: https://dev.meta.ai/docs/guides/coding-agents
 
 ## Web search
 
