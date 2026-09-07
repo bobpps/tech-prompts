@@ -107,6 +107,18 @@ claude-muse --effort low   # override the default effort
 `Path` is set through `[Environment]::SetEnvironmentVariable` rather than `setx`, which truncates
 values at 1024 characters — and the change only reaches newly opened terminals.
 
+## Checking the prompt
+
+```text
+node claude-muse-installer/check.cjs
+```
+
+Extracts all eight files the prompt dictates into a temporary directory, parses the JavaScript,
+runs both test suites, and checks that the test counts quoted in the prose match the counts that
+ran. It also refuses a fenced block that ends early because it contains a fence of its own — the
+failure that once truncated the installed README to a third of its length. No API key, no
+network, about two seconds. It verifies mechanism only; the prose still needs a reader.
+
 ## Source
 
 Generated from the "Claude Muse Installer" artifact (`muse-spark-1.3-contributor` revision):

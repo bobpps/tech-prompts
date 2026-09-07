@@ -1,0 +1,35 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  prompts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # A prompt directory may ship a check.cjs that verifies its own contents.
+      # Every one of them runs; a prompt without one is not an error.
+      - name: Run every prompt's checker
+        run: |
+          shopt -s nullglob
+          checkers=(*/check.cjs)
+          if [ ${#checkers[@]} -eq 0 ]; then
+            echo "No prompt ships a checker yet."
+            exit 0
+          fi
+          status=0
+          for checker in "${checkers[@]}"; do
+            echo "== $checker"
+            node "$checker" || status=1
+          done
+          exit $status
