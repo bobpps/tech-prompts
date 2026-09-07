@@ -540,10 +540,15 @@ function spawnOptions() {
   return { stdio: 'inherit' };
 }
 
-// Whether this process has a controlling terminal. Opening `/dev/tty` succeeds
-// exactly when it does, and fails with ENXIO when it does not, which is the
-// question worth asking: Ctrl+C goes to the foreground process group of the
-// controlling terminal, whatever this process has done with its descriptors.
+// Whether this process has a controlling terminal, which is the only thing that
+// decides whether a terminal-generated signal reaches its process group. Opening
+// `/dev/tty` succeeds exactly when it does and fails with ENXIO when it does
+// not. This is the whole test: `isTTY` on the standard streams answers a
+// different question and is wrong in both directions. All three streams can be
+// redirected while the process sits in the terminal's foreground group and still
+// gets Ctrl+C (`claude-muse -p x </dev/null >out 2>err`), and all three can be
+// pty descriptors in a process that has no controlling terminal at all, which is
+// what `setsid` with inherited descriptors produces.
 function hasControllingTerminal(ttyPath = '/dev/tty') {
   try {
     fs.closeSync(fs.openSync(ttyPath, 'r'));
@@ -551,15 +556,6 @@ function hasControllingTerminal(ttyPath = '/dev/tty') {
   } catch {
     return false;
   }
-}
-
-// True when a terminal could be generating signals for this process group. A
-// stream that is a TTY settles it without a syscall; `isTTY` being false settles
-// nothing, because `claude-muse -p x </dev/null >out 2>err` from a terminal is
-// still in that terminal's foreground group and still gets Ctrl+C.
-function hasTerminal() {
-  return ['stdin', 'stdout', 'stderr'].some(stream => process[stream] && process[stream].isTTY)
-    || hasControllingTerminal();
 }
 
 // Which signals this process absorbs and which it passes on. Only the two the
@@ -571,16 +567,17 @@ function hasTerminal() {
 // as "force quit", so one Ctrl+C would cancel twice. They are absorbed instead,
 // which also keeps this process alive to close the proxy after the child exits.
 //
-// With no terminal anywhere — a supervisor, a CI step, a script — nothing can be
-// generating them for the group, so a signal that arrives was aimed at this pid
-// alone and the child has not seen it. Absorbing there would leave a cancelled
-// run running, so they are forwarded.
+// With no controlling terminal — a supervisor, a CI step, a script, anything
+// started under `setsid` — nothing can be generating them for the group, so a
+// signal that arrives was aimed at this pid alone and the child has not seen it.
+// Absorbing there would leave a cancelled run running, so they are forwarded.
 //
-// What stays undecidable is a supervisor that inherits a terminal and signals by
-// pid: that reads as the terminal case and is absorbed. Nothing in Node says who
-// sent a signal. SIGTERM is never terminal-generated and is always forwarded,
-// which is why it is the documented way to cancel a run by pid.
-function signalPlan(platform = process.platform, terminal = hasTerminal()) {
+// What stays undecidable is a supervisor that keeps this process in a terminal's
+// session and signals by pid: that reads as the terminal case and is absorbed.
+// Nothing in Node says who sent a signal. SIGTERM is never terminal-generated
+// and is always forwarded, which is why it is the documented way to cancel a run
+// by pid.
+function signalPlan(platform = process.platform, terminal = hasControllingTerminal()) {
   if (platform === 'win32') return { absorb: ['SIGINT', 'SIGBREAK'], forward: [] };
   return terminal
     ? { absorb: ['SIGINT', 'SIGHUP'], forward: ['SIGTERM'] }
@@ -1117,9 +1114,11 @@ test('the child stays in the shell-controlled job, and terminal signals are not 
   // these to a single process, so it does not change with the terminal.
   assert.deepEqual(signalPlan('win32', false), signalPlan('win32', true));
 
-  // Which branch is taken comes from opening the controlling terminal, not from
-  // isTTY: a redirected stream says nothing about whether Ctrl+C still arrives.
-  // The path is a parameter so both answers can be asserted anywhere.
+  // Which branch is taken comes from opening the controlling terminal, and from
+  // nothing else. isTTY is wrong in both directions: redirected streams in a
+  // foreground job still get Ctrl+C, and pty descriptors under `setsid` belong
+  // to a process that has no controlling terminal at all. The path is a
+  // parameter so both answers can be asserted anywhere.
   const dir = tempDir();
   const present = path.join(dir, 'tty');
   fs.writeFileSync(present, '');
