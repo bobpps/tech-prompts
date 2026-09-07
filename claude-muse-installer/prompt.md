@@ -102,7 +102,14 @@ First inspect the environment:
    report whether they agree; if they do not, the Node-reported path is the one
    the installation uses.
 2. Confirm that `node` and `claude` are available. On POSIX also confirm
-   `bash`. Native Windows needs no shell beyond `cmd.exe`.
+   `bash`. On native Windows confirm PowerShell — Windows PowerShell 5.1, which
+   ships with the system, or PowerShell 7 or newer — and report the version.
+   Every Windows step below is written in it: the `Path` edit needs
+   `[Environment]::SetEnvironmentVariable`, and the verification and smoke-test
+   blocks are PowerShell throughout. If it is missing or blocked by policy,
+   stop and say so rather than starting an install that cannot be finished.
+   This is a requirement for installing, not for running: the installed
+   `claude-muse.cmd` is a batch shim and works from `cmd.exe` afterwards.
 3. Require Node.js 18.8 or newer, and say why when you report the version.
    `http.Server.closeAllConnections()`, which the launcher calls on every exit
    and the adapter test calls during teardown, was added in Node 18.2.0; on
@@ -462,11 +469,27 @@ function targetFromShim(shim) {
   try { return fs.statSync(target).isFile() ? target : null; } catch { return null; }
 }
 
+// The four forms `claude` can take on Windows, ordered the way the shell orders
+// them: by `PATHEXT`. A user who puts `.CMD` before `.EXE` there has told the
+// system which one wins in a directory holding both, and this has to agree or
+// the launcher starts an installation the user's own `claude` does not.
+// Anything `PATHEXT` does not mention goes last, in the conventional order —
+// `.PS1` is never in it, since PowerShell resolves its own scripts, and a
+// truncated `PATHEXT` should not make an installed Claude invisible.
+const CLAUDE_FORMS = ['.COM', '.EXE', '.CMD', '.PS1'];
+
+function claudeNames(pathext = process.env.PATHEXT) {
+  const listed = String(pathext || '').split(';').map(entry => entry.trim().toUpperCase());
+  const ordered = listed.filter(entry => CLAUDE_FORMS.includes(entry));
+  for (const form of CLAUDE_FORMS) if (!ordered.includes(form)) ordered.push(form);
+  return ordered.map(form => 'claude' + form.toLowerCase());
+}
+
 // POSIX resolves `claude` itself. Windows needs the real program, because
 // child_process cannot execute a .cmd shim without a shell. Claude Code ships a
 // native binary, so its shim normally points at claude.exe rather than at a .js
 // entry point; both shapes are handled, and neither goes through cmd.exe.
-function resolveClaude(windows = WINDOWS, pathValue = process.env.PATH || '') {
+function resolveClaude(windows = WINDOWS, pathValue = process.env.PATH || '', pathext = process.env.PATHEXT) {
   if (!windows) return { file: 'claude', prefix: [] };
   // One pass over PATH, in PATHEXT order inside each directory, because that is
   // how the shell picks: the first directory holding any of these wins, so a
@@ -474,7 +497,7 @@ function resolveClaude(windows = WINDOWS, pathValue = process.env.PATH || '') {
   // executable first and only then for shims would quietly run a different
   // installation from the one the user's own `claude` runs — and the one whose
   // version this install just checked.
-  const found = findOnPath(['claude.com', 'claude.exe', 'claude.cmd', 'claude.ps1'], pathValue);
+  const found = findOnPath(claudeNames(pathext), pathValue);
   if (!found) return null;
   if (/\.(com|exe)$/i.test(found)) return { file: found, prefix: [] };
   const target = targetFromShim(found);
@@ -564,7 +587,7 @@ async function main() {
 
 module.exports = {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, signalPlan, exitStatus, SCRUB, DEFAULTS,
+  findOnPath, targetFromShim, resolveClaude, claudeNames, signalPlan, exitStatus, SCRUB, DEFAULTS,
 };
 
 if (require.main === module) {
@@ -849,7 +872,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, signalPlan, exitStatus,
+  findOnPath, targetFromShim, resolveClaude, claudeNames, signalPlan, exitStatus,
 } = require('./launcher.cjs');
 
 const KEY = 'LLM|1234567890|abcdefg_hijklmn';
@@ -995,6 +1018,29 @@ test('a real claude.exe on PATH wins, and an unreadable shim yields nothing', ()
   fs.writeFileSync(path.join(empty, 'claude.cmd'), 'echo nothing useful here\r\n');
   assert.equal(targetFromShim(path.join(empty, 'claude.cmd')), null);
   assert.equal(resolveClaude(true, empty), null);
+});
+
+test('PATHEXT decides which form wins inside a directory', () => {
+  // Both installed side by side, which is what an npm install next to a native
+  // one looks like. The order is the user's to set, not this launcher's.
+  const dir = tempDir();
+  const exe = path.join(dir, 'claude.exe');
+  const shipped = path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'claude.exe');
+  fs.mkdirSync(path.dirname(shipped), { recursive: true });
+  fs.writeFileSync(exe, 'MZ');
+  fs.writeFileSync(shipped, 'MZ');
+  fs.writeFileSync(path.join(dir, 'claude.cmd'), SHIM_HEAD +
+    '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\claude.exe"  %*\r\n');
+
+  assert.deepEqual(resolveClaude(true, dir, '.COM;.EXE;.BAT;.CMD'), { file: exe, prefix: [] });
+  assert.deepEqual(resolveClaude(true, dir, '.COM;.CMD;.BAT;.EXE'), { file: shipped, prefix: [] });
+  // Unset, and PATHEXT without any of these, both fall back to the conventional
+  // order rather than finding nothing.
+  assert.deepEqual(resolveClaude(true, dir, undefined), { file: exe, prefix: [] });
+  assert.deepEqual(resolveClaude(true, dir, '.VBS;.JS'), { file: exe, prefix: [] });
+  // .PS1 is never in PATHEXT, so it has to survive as the last resort.
+  assert.ok(claudeNames('.EXE').includes('claude.ps1'));
+  assert.deepEqual(claudeNames('.CMD;.EXE'), ['claude.cmd', 'claude.exe', 'claude.com', 'claude.ps1']);
 });
 
 test('a signal is absorbed only where the terminal already delivered it', () => {
@@ -1624,10 +1670,10 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twenty-two offline tests in total: ten in `adapter.test.cjs` and
-twelve in `launcher.test.cjs`. All twenty-two must pass on both platforms; five
-of them exercise the Windows program-resolution logic against realistic npm shims
-and run correctly on POSIX as well. Report the count you actually observed.
+There are twenty-three offline tests in total: ten in `adapter.test.cjs` and
+thirteen in `launcher.test.cjs`. All twenty-three must pass on both platforms;
+six of them exercise the Windows program-resolution logic against realistic npm
+shims and run correctly on POSIX as well. Report the count you actually observed.
 
 Then confirm that `claude-muse` resolves as a command in a freshly started
 terminal. If a startup file or the user `Path` was changed, explain how to
