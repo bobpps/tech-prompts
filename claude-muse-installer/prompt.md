@@ -307,9 +307,17 @@ function parseEnvFile(text) {
     const key = entry.slice(0, split).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     let value = entry.slice(split + 1).trim();
+    // A quoted value ends at its closing quote, and whatever follows is a
+    // comment; the quotes have to come off either way. Testing that the value
+    // *ends* with the quote instead would miss `'https://api.meta.ai' # note`
+    // and hand the launcher a URL with quote marks in it. Inside the quotes a
+    // `#` is part of the value, so the comment is found only after they are
+    // matched, never before. An unterminated quote is left exactly as written
+    // rather than guessed at.
     const quote = value[0];
-    if ((quote === "'" || quote === '"') && value.length > 1 && value.endsWith(quote)) {
-      value = value.slice(1, -1);
+    if (quote === "'" || quote === '"') {
+      const close = value.indexOf(quote, 1);
+      if (close > 0) value = value.slice(1, close);
     } else if (value.includes(' #')) {
       value = value.slice(0, value.indexOf(' #')).trim();
     }
@@ -793,6 +801,25 @@ test('provider.env survives a Windows editor: BOM, CRLF, quotes, comments', () =
   assert.equal(config.MUSE_EFFORT, 'high');
   assert.equal(config.MUSE_MAX_CONTEXT_TOKENS, '1048576');
   assert.equal(Object.keys(config).length, 5);
+});
+
+test('a comment after a quoted value is a comment, not part of the value', () => {
+  const config = parseEnvFile(
+    "MUSE_BASE_URL='https://api.meta.ai' # production\n" +
+    'MUSE_MODEL="muse-spark-1.3-contributor"  # pinned\n' +
+    "MUSE_AUTH_TOKEN='" + KEY + "' # rotated 2026-09-01\n" +
+    // A # inside the quotes belongs to the value: the closing quote is found
+    // before any comment is looked for.
+    "MUSE_EFFORT='high # not a comment'\n" +
+    // Nothing sensible to salvage from an unterminated quote, so it is left be.
+    "MUSE_MAX_CONTEXT_TOKENS='1048576"
+  );
+  assert.equal(config.MUSE_BASE_URL, 'https://api.meta.ai');
+  assert.doesNotThrow(() => new URL(config.MUSE_BASE_URL));
+  assert.equal(config.MUSE_MODEL, 'muse-spark-1.3-contributor');
+  assert.equal(config.MUSE_AUTH_TOKEN, KEY);
+  assert.equal(config.MUSE_EFFORT, 'high # not a comment');
+  assert.equal(config.MUSE_MAX_CONTEXT_TOKENS, "'1048576");
 });
 
 test('loadConfig applies defaults, rejects the placeholder and an empty key', () => {
@@ -1454,8 +1481,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are nineteen offline tests in total: eight in `adapter.test.cjs` and
-eleven in `launcher.test.cjs`. All nineteen must pass on both platforms; five of
+There are twenty offline tests in total: eight in `adapter.test.cjs` and
+twelve in `launcher.test.cjs`. All twenty must pass on both platforms; five of
 them exercise the Windows program-resolution logic against realistic npm shims
 and run correctly on POSIX as well. Report the count you actually observed.
 
