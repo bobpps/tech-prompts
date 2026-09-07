@@ -65,10 +65,12 @@ First inspect the environment:
    the installation uses.
 2. Confirm that `node` and `claude` are available. On POSIX also confirm
    `bash`. Native Windows needs no shell beyond `cmd.exe`.
-3. Require Node.js 18.2 or newer. `http.Server.closeAllConnections()`, which the
-   launcher calls on every exit and the adapter test calls during teardown,
-   was added in Node 18.2.0; on 18.0 and 18.1 it throws instead, so the proxy is
-   never closed and the launcher cannot exit cleanly. If Node is missing or
+3. Require Node.js 18.8 or newer, and say why when you report the version.
+   `http.Server.closeAllConnections()`, which the launcher calls on every exit
+   and the adapter test calls during teardown, was added in Node 18.2.0; on
+   earlier 18.x it throws instead, so the proxy is never closed and the launcher
+   cannot exit cleanly. The `after` hook that `launcher.test.cjs` uses to remove
+   its temporary directories was added in Node 18.8.0. If Node is missing or
    older, explain the exact prerequisite and pause before installing system
    software.
 4. Print the Claude Code version, but do not invoke Anthropic authentication.
@@ -467,6 +469,39 @@ function plainCacheControl(node) {
   return node;
 }
 
+// A request this adapter refuses to forward, reported to Claude Code as a 400
+// with an explanation rather than an opaque upstream failure.
+class UnsupportedRequest extends Error {}
+
+// Meta's `web_search_20250305` accepts `type`, `name`, `user_location` and
+// `cache_control`, and rejects every other field with HTTP 400.
+//
+// Claude Code always sends `max_uses`, a cap on how many searches one turn may
+// run. Dropping it costs only that cap — the provider applies its own — so web
+// search works instead of failing on every call.
+//
+// `allowed_domains` and `blocked_domains` are different: they are a restriction
+// the operator configured. Forwarding a search without them would query domains
+// they deliberately excluded, so those requests are refused here, with an
+// explanation, instead of being quietly widened.
+const WEB_SEARCH_KEEP = ['type', 'name', 'user_location', 'cache_control'];
+const WEB_SEARCH_REFUSE = ['allowed_domains', 'blocked_domains'];
+
+function webSearchTools(body) {
+  for (const tool of body.tools || []) {
+    if (typeof tool?.type !== 'string' || !tool.type.startsWith('web_search')) continue;
+    const refused = WEB_SEARCH_REFUSE.filter(field => tool[field] !== undefined);
+    if (refused.length) {
+      throw new UnsupportedRequest(
+        'Meta does not support ' + refused.join(' or ') + ' on web_search. Remove the ' +
+        'domain filter from your Claude Code settings, or disable the WebSearch tool.'
+      );
+    }
+    for (const field of Object.keys(tool)) if (!WEB_SEARCH_KEEP.includes(field)) delete tool[field];
+  }
+  return body;
+}
+
 function sseFrame(frame, names) {
   const lines = frame.split(/\r?\n/);
   const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
@@ -512,7 +547,7 @@ async function startProxy(upstream, token) {
       target.search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
-        body: raw ? JSON.stringify(plainCacheControl(names.request(JSON.parse(raw)))) : undefined,
+        body: raw ? JSON.stringify(plainCacheControl(webSearchTools(names.request(JSON.parse(raw))))) : undefined,
       });
       res.statusCode = response.status;
       for (const [key, value] of response.headers) {
@@ -538,10 +573,16 @@ async function startProxy(upstream, token) {
       } else {
         res.end(Buffer.from(await response.arrayBuffer()));
       }
-    } catch {
+    } catch (error) {
+      const refused = error instanceof UnsupportedRequest;
       if (!res.headersSent) {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Local Muse adapter could not complete the upstream request.' } }));
+        res.writeHead(refused ? 400 : 502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: refused
+            ? { type: 'invalid_request_error', message: error.message }
+            : { type: 'api_error', message: 'Local Muse adapter could not complete the upstream request.' },
+        }));
       } else res.destroy();
     } finally { clearTimeout(timer); }
   });
@@ -552,7 +593,7 @@ async function startProxy(upstream, token) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl };
+module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -701,7 +742,7 @@ Create `~/.local/lib/claude-muse/adapter.test.cjs` with this exact content:
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { ToolNames, sseFrame, startProxy, plainCacheControl } = require('./adapter.cjs');
+const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -780,6 +821,24 @@ test('cache_control keeps only its type, everywhere it can appear', () => {
   assert.equal(body.system[0].text, 'a');
   assert.deepEqual(plainCacheControl({ cache_control: null }), { cache_control: null });
 });
+
+test('web_search keeps only the fields Meta accepts; domain filters are refused', () => {
+  const body = webSearchTools({
+    tools: [
+      { type: 'web_search_20250305', name: 'web_search', max_uses: 9, user_location: { type: 'approximate' }, cache_control: { type: 'ephemeral' } },
+      { name: 'Read', input_schema: { type: 'object' }, max_uses: 3 },
+    ],
+  });
+  assert.deepEqual(Object.keys(body.tools[0]).sort(), ['cache_control', 'name', 'type', 'user_location']);
+  // An ordinary client tool is never touched, whatever fields it carries.
+  assert.equal(body.tools[1].max_uses, 3);
+  for (const field of ['allowed_domains', 'blocked_domains']) {
+    assert.throws(
+      () => webSearchTools({ tools: [{ type: 'web_search_20250305', name: 'web_search', [field]: ['example.com'] }] }),
+      error => error instanceof UnsupportedRequest && error.message.includes(field)
+    );
+  }
+});
 ```
 
 Create `~/.local/lib/claude-muse/README.md` with this exact content:
@@ -798,9 +857,9 @@ native Windows from the same code.
 
 ## Runtime requirements
 
-Node.js 18.2 or newer. The launcher closes the loopback proxy with
-`server.closeAllConnections()`, which was added in Node 18.2.0 and throws on
-earlier 18.x releases.
+Node.js 18.8 or newer. The launcher closes the loopback proxy with
+`server.closeAllConnections()`, added in Node 18.2.0, and the offline tests use
+the `after` hook of `node:test`, added in Node 18.8.0.
 
 Every path is resolved from `os.homedir()`. Under Git Bash or another MSYS shell
 that is `%USERPROFILE%`, regardless of what the shell's `$HOME` says, which is
@@ -814,6 +873,23 @@ The adapter replaces long names with deterministic, readable hashed aliases
 in tool definitions, tool choices, history, and tool references. It restores
 the original names in JSON and streaming responses before Claude Code sees them.
 Tool inputs, schemas, and text are not rewritten.
+
+## Web search
+
+Meta's `web_search_20250305` accepts only `type`, `name`, `user_location` and
+`cache_control`. Claude Code always sends `max_uses` too, so without this
+adapter every WebSearch call fails with `400 web_search field "max_uses" is not
+supported` and the model quietly answers from memory instead. The adapter drops
+`max_uses`; the provider applies its own cap.
+
+`allowed_domains` and `blocked_domains` are rejected by Meta as well, and the
+adapter does not drop those. They are a restriction you configured, and a
+search without them would reach domains you excluded on purpose, so such a
+request is refused locally with an explanation. Remove the domain filter from
+your Claude Code settings, or turn the WebSearch tool off.
+
+Page fetching happens inside Meta's own search tool. The separate
+`web_fetch_20250910` tool type is not supported by the provider.
 
 ## Where the key lives
 
@@ -1054,8 +1130,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twelve offline tests in total: four in `adapter.test.cjs` and eight
-in `launcher.test.cjs`. All twelve must pass on both platforms; four of them
+There are thirteen offline tests in total: five in `adapter.test.cjs` and eight
+in `launcher.test.cjs`. All thirteen must pass on both platforms; four of them
 exercise the Windows program-resolution logic against realistic npm shims and
 run correctly on POSIX as well. Report the count you actually observed.
 
@@ -1141,6 +1217,20 @@ are both absent from the child environment, and explain that `/effort low`,
 `/effort medium`, and `/effort high` are available after starting a fresh
 interactive session.
 
+Check web search with one live call, because it is the only path that exercises
+a Meta server-side tool:
+
+```text
+claude-muse -p 'Use WebSearch to find the current stable Node.js version. Cite the URL.' \
+  --allowedTools WebSearch --no-session-persistence --output-format json
+```
+
+`is_error` must be false and the answer must carry a source URL. A 400 reading
+"web_search field max_uses is not supported" here means the adapter is not
+normalising the tool definition; fix that before continuing. Note that Meta does
+not report `server_tool_use` counters back, so `web_search_requests` stays `0` in
+the JSON result even when the search ran — judge by the answer, not the counter.
+
 Finally, run a temporary-directory integration test that allows only Read, Grep,
 Bash, Edit, and Agent. Have Muse read a small fixture, grep one marker, run a
 working-directory command, edit one line, and ask a general-purpose subagent to
@@ -1175,7 +1265,7 @@ At completion, report:
 - Claude Code, Node.js, and platform versions;
 - direct Meta API result without secret material;
 - model ID, context window, default effort, and supported `/effort` choices;
-- offline test count and integration-test results;
+- offline test count, the web-search live check, and integration-test results;
 - any untested limitation;
 - the commands `claude-muse` and `claude-muse --continue`.
 

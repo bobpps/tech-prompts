@@ -5,13 +5,13 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs twelve offline
+detects the platform once and follows only that branch; it writes the files, runs thirteen offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
 
-- Node.js 18.2 or newer (the launcher closes the proxy with
-  `server.closeAllConnections()`, added in 18.2.0)
+- Node.js 18.8 or newer (`server.closeAllConnections()` landed in 18.2.0, and the offline
+  tests use the `node:test` `after` hook, which landed in 18.8.0)
 - Claude Code already installed (`claude.exe`/`claude.com` on `PATH`, or an npm shim on Windows)
 - No root, no administrator elevation — everything lands in the home directory
 - A Meta Model API key, which **you** add locally after the files exist
@@ -24,7 +24,7 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
 ~/.local/lib/claude-muse/launcher.test.cjs   eight offline tests
-~/.local/lib/claude-muse/adapter.test.cjs    four offline tests
+~/.local/lib/claude-muse/adapter.test.cjs    five offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
 ~/.config/claude-muse/provider.env   base URL, model, effort — and your key
 ```
@@ -33,7 +33,24 @@ The launcher scrubs Anthropic and experimental variables out of the child enviro
 internal model role (Fable, Opus, Sonnet, Haiku, subagents) to the Contributor model ID, and pins
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576` so Claude Code stops assuming a 200,000-token window for
 an unknown model ID. The adapter is a loopback proxy that shortens tool names over Meta's
-64-character limit and reduces `cache_control` to the plain `ephemeral` form Meta accepts.
+64-character limit, reduces `cache_control` to the plain `ephemeral` form Meta accepts, and
+normalises the `web_search` tool definition.
+
+## Web search
+
+Meta's `web_search_20250305` accepts only `type`, `name`, `user_location` and `cache_control`.
+Claude Code always sends `max_uses` as well, so without the adapter every WebSearch call fails
+with `400 web_search field "max_uses" is not supported` and the model silently answers from
+memory instead. The adapter drops `max_uses` — the provider applies its own cap — and search
+works.
+
+`allowed_domains` and `blocked_domains` are rejected by Meta too, but the adapter does not drop
+them: they are a restriction the operator configured, and searching without them would reach
+domains that were deliberately excluded. A request carrying either one is refused locally with an
+explanation. Remove the domain filter from your Claude Code settings, or turn WebSearch off.
+
+Meta's server-side search covers page fetches through the same tool; the separate
+`web_fetch_20250910` tool type is not supported by the provider at all.
 
 Default effort is `high`, injected as a CLI argument, so `claude-muse --effort low` and the
 in-session `/effort` command still win.
