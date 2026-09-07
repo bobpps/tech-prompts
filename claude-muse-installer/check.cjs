@@ -187,7 +187,7 @@ for (const [name, file] of written) {
 
 // ---------------------------------------------------------------- prose
 
-// "There are twenty-one offline tests in total: nine in `adapter.test.cjs` and
+// "There are twenty-two offline tests in total: ten in `adapter.test.cjs` and
 // twelve in `launcher.test.cjs`." Prose that drifts from the code is how a
 // reader stops trusting either.
 // Hyphenated compounds are summed, so the sentence can keep spelling its

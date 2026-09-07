@@ -123,14 +123,32 @@ First inspect the environment:
 
    Under zsh, the default on macOS, that is `~/.zshrc`.
 
-   Under bash, append to the file bash already reads, and never create one that
-   shadows another. For a login shell that is the first of `~/.bash_profile`,
-   `~/.bash_login` and `~/.profile` that exists; create `~/.bash_profile` only
-   when none of the three does. Creating it next to an existing `~/.profile`
-   would silently stop every line of that file from running at login, because
-   bash reads only the first of the three it finds. For an interactive non-login
-   shell the file is `~/.bashrc`. Report which file you chose and whether it
-   already existed.
+   Under bash, both startup modes have to end up with the entry, and the mode
+   you are running in now tells you nothing about the one the user opens next: a
+   login shell — an SSH session, a macOS terminal — reads the profile and not
+   `~/.bashrc`, while an interactive non-login shell, which is what most
+   terminal windows on Linux open, reads `~/.bashrc` and not the profile.
+   Writing to only the file this session happens to use leaves `claude-muse`
+   missing in the other.
+
+   So:
+
+   1. Find the login file: the first of `~/.bash_profile`, `~/.bash_login` and
+      `~/.profile` that exists. Create `~/.bash_profile` only when none of the
+      three does. Creating it next to an existing `~/.profile` would silently
+      stop every line of that file from running at login, because bash reads
+      only the first of the three it finds.
+   2. Read that file. If it already sources `~/.bashrc` — a `.` or `source`
+      line naming it, which is what many distributions ship — then `~/.bashrc`
+      alone reaches both modes, and it is the only file to touch.
+   3. Otherwise add the line to both the login file and `~/.bashrc`, creating
+      `~/.bashrc` if it does not exist. Do not make the profile source
+      `~/.bashrc` to avoid the second edit: that changes how every future login
+      shell starts, which is far more than adding a directory to `PATH`.
+
+   Add nothing that is already there, in either file. Report which files you
+   chose, whether each already existed, and which of the two rules above
+   applied.
 
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
@@ -693,7 +711,6 @@ function sseFrame(frame, names) {
 async function startProxy(upstream, token, idleSeconds) {
   const origin = new URL(upstream);
   const localToken = randomBytes(32).toString('hex');
-  const names = new ToolNames();
   // Idle, not wall-clock. A high-effort turn over a large context can stream for
   // far longer than any fixed cutoff, and aborting a healthy stream mid-flight
   // would truncate the turn: the headers have already gone out, so there is no
@@ -709,6 +726,12 @@ async function startProxy(upstream, token, idleSeconds) {
       res.writeHead(404).end();
       return;
     }
+    // Per request, not per proxy. What a name maps to only has to hold for the
+    // one body it travels in, and aliases are a pure function of the tool name,
+    // so nothing needs carrying between turns. Keeping one table for the life of
+    // the proxy would let a name claimed by a tool set that is no longer loaded
+    // — a subagent's, say — reject a later request that collides with nothing.
+    const names = new ToolNames();
     const abort = new AbortController();
     res.on('close', () => { if (!res.writableFinished) abort.abort(); });
     // The signal reaches `fetch`, but a client that stalls halfway through its
@@ -1162,6 +1185,35 @@ test('web_search keeps only the fields Meta accepts; domain filters are refused'
   }
 });
 
+test('a name claimed by one request does not follow the next one', async () => {
+  // The upstream echoes back the tool names it was given, so the test can see
+  // what actually left the adapter.
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ tools: JSON.parse(Buffer.concat(chunks)).tools.map(tool => tool.name) }));
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  const headers = { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' };
+  const send = tools => fetch(proxy.url + '/v1/messages', { method: 'POST', headers, body: JSON.stringify({ tools }) });
+  try {
+    const alias = new ToolNames().shorten(long);
+    const first = await send([{ name: long }]);
+    assert.equal(first.status, 200);
+    assert.deepEqual((await first.json()).tools, [alias]);
+    // A later turn with a different tool set, one of them named like the alias
+    // the first turn used. Nothing in this request collides with anything in it.
+    const second = await send([{ name: alias }]);
+    assert.equal(second.status, 200, 'the earlier turn poisoned this one');
+    assert.deepEqual((await second.json()).tools, [alias]);
+  } finally {
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
 test('the request timer measures silence, not elapsed time', async () => {
   const upstream = http.createServer(async (req, res) => {
     for await (const chunk of req) void chunk;
@@ -1540,8 +1592,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twenty-one offline tests in total: nine in `adapter.test.cjs` and
-twelve in `launcher.test.cjs`. All twenty-one must pass on both platforms; five
+There are twenty-two offline tests in total: ten in `adapter.test.cjs` and
+twelve in `launcher.test.cjs`. All twenty-two must pass on both platforms; five
 of them exercise the Windows program-resolution logic against realistic npm shims
 and run correctly on POSIX as well. Report the count you actually observed.
 
