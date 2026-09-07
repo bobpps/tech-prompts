@@ -522,14 +522,28 @@ const { once } = require('node:events');
 class ToolNames {
   constructor() { this.originals = new Map(); }
 
+  // Every name that travels upstream is claimed, whether this rewrote it or
+  // not. Two tools arriving under one name is not a case to resolve quietly:
+  // upstream would see a duplicate definition, and a response naming it would
+  // be restored as whichever tool claimed it, which is how a call meant for one
+  // tool gets delivered to another.
+  claim(upstream, original) {
+    const previous = this.originals.get(upstream);
+    if (previous && previous !== original) throw new Error('Tool alias collision');
+    this.originals.set(upstream, original);
+    return upstream;
+  }
+
   shorten(name) {
-    if (typeof name !== 'string' || name.length <= 64) return name;
+    if (typeof name !== 'string') return name;
+    // A name short enough to pass through still has to be claimed: an alias
+    // generated for some longer tool can land on exactly this string, and
+    // whichever of the two is processed second would otherwise take it over
+    // in silence.
+    if (name.length <= 64) return this.claim(name, name);
     const label = name.split('__').at(-1).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 42);
     const alias = 'muse_' + label + '_' + createHash('sha256').update(name).digest('hex').slice(0, 16);
-    const previous = this.originals.get(alias);
-    if (previous && previous !== name) throw new Error('Tool alias collision');
-    this.originals.set(alias, name);
-    return alias;
+    return this.claim(alias, name);
   }
 
   restore(name) { return this.originals.get(name) || name; }
@@ -992,6 +1006,25 @@ test('long names round-trip without changing inputs or schemas', () => {
   assert.equal(new ToolNames().shorten(long), alias);
   assert.notEqual(names.shorten(long + '2'), alias);
   assert.equal(names.shorten('a'.repeat(64)), 'a'.repeat(64));
+});
+
+test('a tool named exactly like an alias cannot take it over', () => {
+  // The alias is deterministic, so a tool can be declared with that name — by a
+  // server that wants the other tool's calls, or by coincidence. Either way the
+  // two cannot share one name upstream.
+  const alias = new ToolNames().shorten(long);
+  assert.ok(alias.length <= 64, 'an alias is short enough to be a legal tool name');
+  for (const tools of [[{ name: alias }, { name: long }], [{ name: long }, { name: alias }]]) {
+    assert.throws(() => new ToolNames().request({ tools }), /collision/i);
+  }
+  // A short name that collides with nothing is still passed through untouched,
+  // and declaring the same tool twice is not a collision.
+  const names = new ToolNames();
+  assert.deepEqual(
+    names.request({ tools: [{ name: 'read' }, { name: 'read' }] }).tools.map(t => t.name),
+    ['read', 'read']
+  );
+  assert.equal(names.restore('read'), 'read');
 });
 
 test('SSE event names restore, tool arguments remain untouched', () => {
@@ -1481,9 +1514,9 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twenty offline tests in total: eight in `adapter.test.cjs` and
-twelve in `launcher.test.cjs`. All twenty must pass on both platforms; five of
-them exercise the Windows program-resolution logic against realistic npm shims
+There are twenty-one offline tests in total: nine in `adapter.test.cjs` and
+twelve in `launcher.test.cjs`. All twenty-one must pass on both platforms; five
+of them exercise the Windows program-resolution logic against realistic npm shims
 and run correctly on POSIX as well. Report the count you actually observed.
 
 Then confirm that `claude-muse` resolves as a command in a freshly started

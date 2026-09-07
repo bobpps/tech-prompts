@@ -28,7 +28,7 @@ const note = message => notes.push(message);
 const NUMBERS = {
   one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
   eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
-  eighteen: 18, nineteen: 19, twenty: 20,
+  eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50,
 };
 
 // ---------------------------------------------------------------- parse
@@ -187,18 +187,26 @@ for (const [name, file] of written) {
 
 // ---------------------------------------------------------------- prose
 
-// "There are twenty offline tests in total: eight in `adapter.test.cjs` and
+// "There are twenty-one offline tests in total: nine in `adapter.test.cjs` and
 // twelve in `launcher.test.cjs`." Prose that drifts from the code is how a
 // reader stops trusting either.
+// Hyphenated compounds are summed, so the sentence can keep spelling its
+// numbers out past twenty as the suites grow.
+function spelled(word) {
+  const parts = word.toLowerCase().split('-');
+  if (parts.some(part => NUMBERS[part] === undefined)) return undefined;
+  return parts.reduce((sum, part) => sum + NUMBERS[part], 0);
+}
+
 const prose = lines.join(' ').replace(/\s+/g, ' ');
 const claim = prose.match(
-  /There are (\w+) offline tests in total: (\w+) in `([\w.]+)` and (\w+) in `([\w.]+)`/
+  /There are ([\w-]+) offline tests in total: ([\w-]+) in `([\w.]+)` and ([\w-]+) in `([\w.]+)`/
 );
 if (!claim) {
   fail('the sentence stating the offline test counts was not found');
 } else {
-  const total = NUMBERS[claim[1].toLowerCase()];
-  const expected = [[claim[3], NUMBERS[claim[2].toLowerCase()]], [claim[5], NUMBERS[claim[4].toLowerCase()]]];
+  const total = spelled(claim[1]);
+  const expected = [[claim[3], spelled(claim[2])], [claim[5], spelled(claim[4])]];
   for (const [name, want] of expected) {
     const got = counts.get(name);
     if (want === undefined) fail(`the prompt spells an unrecognised number for ${name}`);
