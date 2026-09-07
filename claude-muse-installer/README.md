@@ -83,7 +83,9 @@ argument, shell history, a debug log or a repository.
   driving a Windows Node runtime, so `os.homedir()` returns `%USERPROFILE%` even when `$HOME`
   points elsewhere. The install resolves the home once with `node -p "require('os').homedir()"`,
   puts everything there, and reports the substitution — otherwise the launcher would look for
-  `provider.env` in a directory the installer never wrote to.
+  `provider.env` in a directory the installer never wrote to. Shell-side entries such as the
+  `PATH` line use the MSYS spelling of that same directory (`/c/Users/you`), because bash reads
+  the drive-letter colon in `C:\Users\you` as a `PATH` separator.
 
 ## Running it
 

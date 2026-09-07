@@ -34,11 +34,27 @@ The shell's `$HOME` is not authoritative. Under Git Bash or another MSYS shell,
 `node` is a Windows program and reports `%USERPROFILE%`, which the user may have
 configured `$HOME` to differ from. `launcher.cjs` always locates `provider.env`
 through `os.homedir()`, so a tree installed under a divergent `$HOME` would
-leave every launch failing with `configuration not found`. If the two paths
-disagree, install under the Node-reported path and substitute that path
-literally wherever `$HOME` appears in the POSIX blocks below — the `PATH` line
-added to the shell startup file, the launcher shim, and the verification
-commands — then state the substitution in the final report.
+leave every launch failing with `configuration not found`.
+
+If the two paths disagree, install under the Node-reported path, and replace
+`$HOME` in the POSIX blocks below with the spelling each place needs. The two
+spellings name the same physical directory:
+
+```bash
+node -p "require('os').homedir()"        # C:\Users\you   — native, for Node
+cygpath -u "$(node -p "require('os').homedir()")"   # /c/Users/you — MSYS, for the shell
+```
+
+- Anywhere the shell itself reads the path — the `PATH` line added to the
+  startup file, and the verification commands — use the MSYS form. A native
+  path cannot go on `PATH`: bash splits on the colon, so `C:\Users\you\.local\bin`
+  becomes the two useless entries `C` and `\Users\you\.local\bin`, and a fresh
+  terminal never finds `claude-muse`. If `cygpath` is unavailable, the
+  conversion is mechanical: `C:\Users\you` is `/c/Users/you`.
+- In the launcher shim, where the path is one argument handed straight to Node,
+  write the native path exactly as Node reported it.
+
+State the substitution, and both spellings, in the final report.
 
 The layout below is identical on every platform except the launcher's file
 extension.
@@ -80,11 +96,18 @@ First inspect the environment:
 6. Check whether `~/.local/bin` is on `PATH`. If it is not, add it idempotently
    and tell me exactly what changed.
 
-   On POSIX, add this exact line to the appropriate user shell startup file:
+   On POSIX, add this exact line to the startup file of the user's login shell —
+   `~/.zshrc` under zsh, which is the default on macOS, `~/.bash_profile` or
+   `~/.bashrc` under bash. Name the file you chose:
 
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
    ```
+
+   Under Git Bash with a divergent `$HOME`, substitute the MSYS spelling of the
+   Node-reported home for `$HOME` here — `export PATH="/c/Users/you/.local/bin:$PATH"`
+   — never the native `C:\Users\you`, whose colon bash would read as a `PATH`
+   separator.
 
    On Windows, set the user-level `Path` variable. Use this, not `setx`, which
    truncates long values at 1024 characters and expands variables:
@@ -151,9 +174,10 @@ never executes it, so shell metacharacters inside the key are inert.
 
 On POSIX, create `~/.local/bin/claude-muse` with mode `700` and this exact
 content. Where the shell's `$HOME` and the Node-reported home disagree — only
-possible under Git Bash or another MSYS shell — write the Node-reported path
-literally in place of `$HOME` on the `exec` line, so the shim points at the tree
-the launcher will actually read:
+possible under Git Bash or another MSYS shell — write the native Node-reported
+path, backslashes and all, in place of `$HOME` on the `exec` line. Node takes it
+as a single argument, so the drive-letter colon is harmless here, and the shim
+then points at the tree the launcher will actually read:
 
 ```bash
 #!/usr/bin/env bash
