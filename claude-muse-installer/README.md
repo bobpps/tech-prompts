@@ -5,7 +5,7 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs sixteen offline
+detects the platform once and follows only that branch; it writes the files, runs seventeen offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
@@ -23,7 +23,7 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/bin/claude-muse.cmd         Windows only, CRLF
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
-~/.local/lib/claude-muse/launcher.test.cjs   nine offline tests
+~/.local/lib/claude-muse/launcher.test.cjs   ten offline tests
 ~/.local/lib/claude-muse/adapter.test.cjs    seven offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
 ~/.config/claude-muse/provider.env   base URL, model, effort, idle timeout — and your key

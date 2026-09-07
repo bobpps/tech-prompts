@@ -187,8 +187,8 @@ for (const [name, file] of written) {
 
 // ---------------------------------------------------------------- prose
 
-// "There are sixteen offline tests in total: seven in `adapter.test.cjs` and
-// nine in `launcher.test.cjs`." Prose that drifts from the code is how a
+// "There are seventeen offline tests in total: seven in `adapter.test.cjs` and
+// ten in `launcher.test.cjs`." Prose that drifts from the code is how a
 // reader stops trusting either.
 const prose = lines.join(' ').replace(/\s+/g, ' ');
 const claim = prose.match(

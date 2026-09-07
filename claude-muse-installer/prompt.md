@@ -46,13 +46,19 @@ cygpath -u "$(node -p "require('os').homedir()")"   # /c/Users/you — MSYS, for
 ```
 
 - Anywhere the shell itself reads the path — the `PATH` line added to the
-  startup file, and the verification commands — use the MSYS form. A native
+  startup file, and every command you run from a shell below, the verification
+  commands and the editor invocation included — use the MSYS form. A native
   path cannot go on `PATH`: bash splits on the colon, so `C:\Users\you\.local\bin`
   becomes the two useless entries `C` and `\Users\you\.local\bin`, and a fresh
   terminal never finds `claude-muse`. If `cygpath` is unavailable, the
   conversion is mechanical: `C:\Users\you` is `/c/Users/you`.
-- In the launcher shim, where the path is one argument handed straight to Node,
-  write the native path exactly as Node reported it.
+- The launcher shim takes no substituted path at all. It resolves the home at
+  run time, the same way the launcher itself does. A path pasted into its `exec`
+  line would have to survive bash's own quoting rules, and Windows allows `$`, a
+  backtick and a single quote in a profile path: inside double quotes
+  `C:\Users\a$b` expands to `C:\Users\a`, and a segment that begins with `$`
+  swallows the separator in front of it, so the shim would point at a file that
+  does not exist.
 
 This governs the files this prompt installs. The shell's own startup file is not
 one of them: it belongs to the shell and stays where the shell looks for it,
@@ -211,11 +217,7 @@ only launcher-side validation needed. The launcher reads this file as data and
 never executes it, so shell metacharacters inside the key are inert.
 
 On POSIX, create `~/.local/bin/claude-muse` with mode `700` and this exact
-content. Where the shell's `$HOME` and the Node-reported home disagree — only
-possible under Git Bash or another MSYS shell — write the native Node-reported
-path, backslashes and all, in place of `$HOME` on the `exec` line. Node takes it
-as a single argument, so the drive-letter colon is harmless here, and the shim
-then points at the tree the launcher will actually read:
+content:
 
 ```bash
 #!/usr/bin/env bash
@@ -224,6 +226,22 @@ set -Eeuo pipefail
 
 exec node "$HOME/.local/lib/claude-muse/launcher.cjs" "$@"
 ```
+
+Where the shell's `$HOME` and the Node-reported home disagree — only possible
+under Git Bash or another MSYS shell — change that last line, and only that
+line, to ask Node where the home is, so the shim points at the tree the launcher
+will actually read:
+
+```bash
+exec node "$(node -p 'require("os").homedir()')/.local/lib/claude-muse/launcher.cjs" "$@"
+```
+
+Do not paste the resolved path in instead. Command substitution hands its result
+straight to the argument, so every character in the path is safe; a pasted path
+is read by bash first, and a profile directory containing `$`, a backtick or a
+single quote would be mangled before Node ever saw it. It also cannot go stale
+if the profile moves. Node accepts the mixed separators in
+`C:\Users\you/.local/...` as one argument.
 
 On native Windows, create `~/.local/bin/claude-muse.cmd` with this exact
 content, written with CRLF line endings:
@@ -408,6 +426,17 @@ function resolveClaude(windows = WINDOWS, pathValue = process.env.PATH || '') {
     : { file: target, prefix: [] };
 }
 
+// The status this process exits with once the child is gone. A child killed by
+// a signal has no exit code, and the shell convention for that is 128 plus the
+// signal number — 130 for SIGINT, 137 for a SIGKILL from the OOM killer, 143 for
+// SIGTERM. Reporting one fixed number instead would tell every caller the run
+// was terminated politely, whatever actually happened to it.
+function exitStatus(code, signal) {
+  if (code !== null && code !== undefined) return code;
+  const number = os.constants.signals[signal];
+  return number ? 128 + number : 143;
+}
+
 // Which signals this process absorbs and which it passes on. The child shares
 // this process group, so anything the terminal generates — Ctrl+C, a hangup —
 // is delivered to both of us by the kernel: forwarding it would hand Claude
@@ -450,7 +479,7 @@ async function main() {
     process.exitCode = code;
   };
   child.on('error', () => { console.error('Unable to start Claude Code.'); finish(1); });
-  child.on('exit', (code, signal) => finish(code ?? (signal === 'SIGINT' ? 130 : 143)));
+  child.on('exit', (code, signal) => finish(exitStatus(code, signal)));
   const plan = signalPlan();
   for (const signal of plan.absorb) process.on(signal, () => {});
   for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
@@ -458,7 +487,7 @@ async function main() {
 
 module.exports = {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, signalPlan, SCRUB, DEFAULTS,
+  findOnPath, targetFromShim, resolveClaude, signalPlan, exitStatus, SCRUB, DEFAULTS,
 };
 
 if (require.main === module) {
@@ -710,7 +739,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, signalPlan,
+  findOnPath, targetFromShim, resolveClaude, signalPlan, exitStatus,
 } = require('./launcher.cjs');
 
 const KEY = 'LLM|1234567890|abcdefg_hijklmn';
@@ -855,6 +884,20 @@ test('no terminal signal is forwarded, on either platform', () => {
   // child has not seen.
   assert.deepEqual(signalPlan('linux').forward, ['SIGTERM']);
   assert.deepEqual(signalPlan('win32').forward, []);
+});
+
+test('a killed child reports its own signal, not a blanket 143', () => {
+  assert.equal(exitStatus(0, null), 0);
+  assert.equal(exitStatus(2, null), 2);
+  // 128 + the signal number, as a shell reports it. Same numbers on every
+  // platform Node runs these on.
+  assert.equal(exitStatus(null, 'SIGHUP'), 129);
+  assert.equal(exitStatus(null, 'SIGINT'), 130);
+  assert.equal(exitStatus(null, 'SIGKILL'), 137);  // the OOM killer, not a polite stop
+  assert.equal(exitStatus(null, 'SIGTERM'), 143);
+  // Nothing to derive a status from: fall back rather than exit 0 on a death.
+  assert.equal(exitStatus(null, 'NOT_A_SIGNAL'), 143);
+  assert.equal(exitStatus(null, null), 143);
 });
 ```
 
@@ -1197,8 +1240,13 @@ repeated compaction with the full MCP schemas loaded.
 ## Local tests
 
 ```bash
-node --test ~/.local/lib/claude-muse/adapter.test.cjs ~/.local/lib/claude-muse/launcher.test.cjs
+cd "$(node -p 'require("os").homedir()')/.local/lib/claude-muse"
+node --test adapter.test.cjs launcher.test.cjs
 ```
+
+The home comes from Node rather than from `~` because this tree lives where
+`os.homedir()` points. Under Git Bash those can be different directories, and
+`~` would look in the one nothing was installed under.
 
 Restart `claude-muse` after updating the adapter. Existing sessions keep the
 adapter process they started with. Browser or MCP authentication failures are
@@ -1337,8 +1385,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are sixteen offline tests in total: seven in `adapter.test.cjs` and nine
-in `launcher.test.cjs`. All sixteen must pass on both platforms; four of them
+There are seventeen offline tests in total: seven in `adapter.test.cjs` and ten
+in `launcher.test.cjs`. All seventeen must pass on both platforms; four of them
 exercise the Windows program-resolution logic against realistic npm shims and
 run correctly on POSIX as well. Report the count you actually observed.
 
