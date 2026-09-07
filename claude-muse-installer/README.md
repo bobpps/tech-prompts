@@ -10,7 +10,8 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 
 ## Requirements
 
-- Node.js 18 or newer
+- Node.js 18.2 or newer (the launcher closes the proxy with
+  `server.closeAllConnections()`, added in 18.2.0)
 - Claude Code already installed (`claude.exe`/`claude.com` on `PATH`, or an npm shim on Windows)
 - No root, no administrator elevation — everything lands in the home directory
 - A Meta Model API key, which **you** add locally after the files exist
@@ -54,13 +55,18 @@ The prompt carries no API key and instructs the agent never to read one back. Yo
 quotes, after the install has written the file. Never put the key in chat, a command-line
 argument, shell history, a debug log or a repository.
 
-## Two things to know before running it
+## Before you run it
 
 - **The Contributor model permits Meta to use submitted inputs and outputs for model and product
   improvement.** The prompt makes the agent state this before the first live call.
 - **On Windows, `provider.env` is not mode 600.** NTFS has no POSIX permission bits and the
   install deliberately does not touch ACLs, so the key file is readable by any process running as
   you, by local administrators and by `SYSTEM`. The install says so, and so does its final report.
+- **Under Git Bash the home directory is Node's, not the shell's.** Git Bash is a POSIX shell
+  driving a Windows Node runtime, so `os.homedir()` returns `%USERPROFILE%` even when `$HOME`
+  points elsewhere. The install resolves the home once with `node -p "require('os').homedir()"`,
+  puts everything there, and reports the substitution — otherwise the launcher would look for
+  `provider.env` in a directory the installer never wrote to.
 
 ## Running it
 

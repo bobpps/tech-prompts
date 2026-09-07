@@ -6,7 +6,9 @@ Important boundaries:
 
 - Support Linux, macOS, WSL, and native Windows. Determine the platform once,
   before writing anything, and then follow only the rows and blocks marked for
-  that platform. Treat WSL and Git Bash as POSIX.
+  that platform. Treat WSL as POSIX. Git Bash and other MSYS shells are a POSIX
+  shell driving a Windows Node runtime: install the POSIX files, but resolve the
+  home directory the way Node does, never from the shell's `$HOME`.
 - Work in the current user's home directory. Do not require root or
   administrator elevation, and do not put files in `/usr/local/bin`,
   `C:\Program Files`, or any system location.
@@ -22,6 +24,22 @@ Important boundaries:
 
 Throughout this prompt, `~` means the current user's home directory as Node
 reports it from `os.homedir()`: `$HOME` on POSIX, `%USERPROFILE%` on Windows.
+Resolve it once, before writing anything, with:
+
+```bash
+node -p "require('os').homedir()"
+```
+
+The shell's `$HOME` is not authoritative. Under Git Bash or another MSYS shell,
+`node` is a Windows program and reports `%USERPROFILE%`, which the user may have
+configured `$HOME` to differ from. `launcher.cjs` always locates `provider.env`
+through `os.homedir()`, so a tree installed under a divergent `$HOME` would
+leave every launch failing with `configuration not found`. If the two paths
+disagree, install under the Node-reported path and substitute that path
+literally wherever `$HOME` appears in the POSIX blocks below — the `PATH` line
+added to the shell startup file, the launcher shim, and the verification
+commands — then state the substitution in the final report.
+
 The layout below is identical on every platform except the launcher's file
 extension.
 
@@ -41,11 +59,18 @@ The final installation consists of:
 First inspect the environment:
 
 1. Identify the platform: POSIX (Linux, macOS, WSL, Git Bash) or native
-   Windows. Report which one you will install for.
+   Windows. Report which one you will install for. Under Git Bash or another
+   MSYS shell, print both `$HOME` and `node -p "require('os').homedir()"` and
+   report whether they agree; if they do not, the Node-reported path is the one
+   the installation uses.
 2. Confirm that `node` and `claude` are available. On POSIX also confirm
    `bash`. Native Windows needs no shell beyond `cmd.exe`.
-3. Require Node.js 18 or newer. If it is missing or older, explain the exact
-   prerequisite and pause before installing system software.
+3. Require Node.js 18.2 or newer. `http.Server.closeAllConnections()`, which the
+   launcher calls on every exit and the adapter test calls during teardown,
+   was added in Node 18.2.0; on 18.0 and 18.1 it throws instead, so the proxy is
+   never closed and the launcher cannot exit cleanly. If Node is missing or
+   older, explain the exact prerequisite and pause before installing system
+   software.
 4. Print the Claude Code version, but do not invoke Anthropic authentication.
 5. On native Windows, also record how Claude Code is installed: whether
    `claude.exe`/`claude.com` is on `PATH`, or only an npm shim `claude.cmd` is.
@@ -123,7 +148,10 @@ only launcher-side validation needed. The launcher reads this file as data and
 never executes it, so shell metacharacters inside the key are inert.
 
 On POSIX, create `~/.local/bin/claude-muse` with mode `700` and this exact
-content:
+content. Where the shell's `$HOME` and the Node-reported home disagree — only
+possible under Git Bash or another MSYS shell — write the Node-reported path
+literally in place of `$HOME` on the `exec` line, so the shim points at the tree
+the launcher will actually read:
 
 ```bash
 #!/usr/bin/env bash
@@ -768,6 +796,16 @@ library with no platform assumptions: the loopback proxy and the tool-name
 mapping. The split is what lets one installation serve Linux, macOS, WSL and
 native Windows from the same code.
 
+## Runtime requirements
+
+Node.js 18.2 or newer. The launcher closes the loopback proxy with
+`server.closeAllConnections()`, which was added in Node 18.2.0 and throws on
+earlier 18.x releases.
+
+Every path is resolved from `os.homedir()`. Under Git Bash or another MSYS shell
+that is `%USERPROFILE%`, regardless of what the shell's `$HOME` says, which is
+why the installer put these files under the Node-reported home.
+
 ## Tool-name aliasing
 
 Meta rejects tool names longer than 64 characters. Installed Chrome DevTools
@@ -1128,6 +1166,8 @@ the aliasing test; report it accurately and do not change unrelated MCP config.
 At completion, report:
 
 - the detected platform, and which files were written for it;
+- under Git Bash or another MSYS shell, whether `$HOME` and `os.homedir()`
+  agreed, and which home directory the installation used;
 - paths and, on POSIX, permissions created;
 - on Windows, how Claude Code was located (`claude.exe` or npm shim) and the
   explicit statement that `provider.env` is protected only by inherited profile
