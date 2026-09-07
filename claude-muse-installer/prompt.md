@@ -535,22 +535,35 @@ function spawnOptions(platform = process.platform) {
   return { stdio: 'inherit', detached: platform !== 'win32' };
 }
 
-// Which signals this process absorbs and which it passes on.
+// Which signals this process absorbs, which it passes on, and which suspend the
+// pair.
 //
-// On POSIX everything is forwarded, because with the child in its own group
-// nothing else reaches it: absorbing would leave a cancelled run running, with
-// the launcher declining to die, Claude Code never told, and the proxy up.
-// SIGWINCH is in the list for the same reason — a resize goes to the terminal's
-// foreground group, which is now this process, and a TUI that never hears about
-// it stops reflowing.
+// On POSIX everything the terminal can produce is forwarded, because with the
+// child in its own group nothing else reaches it: absorbing would leave a
+// cancelled run running, with the launcher declining to die, Claude Code never
+// told, and the proxy up. SIGWINCH is in the list for the same reason — a
+// resize goes to the terminal's foreground group, which is now this process,
+// and a TUI that never hears about it stops reflowing. SIGQUIT is there because
+// Ctrl+\ would otherwise kill the launcher and leave the child running against
+// a terminal the shell has taken back.
+//
+// SIGTSTP cannot simply be forwarded: a detached child's process group is
+// orphaned by definition — its only parent is in another session — and POSIX
+// discards stop signals sent to an orphaned group, so the child would keep
+// running while the launcher stopped. That is what `suspend` is for, and why it
+// is a separate list rather than another entry in `forward`.
 //
 // Windows has no process groups to arrange and no way to send one of these to a
 // single process; its console delivers Ctrl+C to the child already, so those
 // are absorbed to keep this process alive long enough to close the proxy.
 function signalPlan(platform = process.platform) {
   return platform === 'win32'
-    ? { absorb: ['SIGINT', 'SIGBREAK'], forward: [] }
-    : { absorb: [], forward: ['SIGINT', 'SIGHUP', 'SIGTERM', 'SIGWINCH'] };
+    ? { absorb: ['SIGINT', 'SIGBREAK'], forward: [], suspend: [] }
+    : {
+      absorb: [],
+      forward: ['SIGINT', 'SIGHUP', 'SIGTERM', 'SIGQUIT', 'SIGWINCH', 'SIGCONT'],
+      suspend: ['SIGTSTP'],
+    };
 }
 
 async function main() {
@@ -584,6 +597,18 @@ async function main() {
   const plan = signalPlan();
   for (const signal of plan.absorb) process.on(signal, () => {});
   for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
+  for (const signal of plan.suspend) {
+    process.on(signal, () => {
+      // SIGSTOP, not the signal that arrived: a stop signal is discarded when it
+      // lands on an orphaned process group, and SIGSTOP is not one of those.
+      // Stop the child first, so nothing writes to a terminal the shell has
+      // taken back, then stop this process — SIGSTOP again, since re-raising
+      // SIGTSTP would only re-enter this handler. `fg` sends SIGCONT here, and
+      // the forward list passes it on, so the pair resumes together.
+      child.kill('SIGSTOP');
+      process.kill(process.pid, 'SIGSTOP');
+    });
+  }
 }
 
 module.exports = {
@@ -1056,8 +1081,16 @@ test('the child owns its process group, so every signal is forwarded once', () =
       assert.ok(plan.forward.includes(signal), `${platform} drops ${signal} instead of passing it on`);
     }
     // A resize now reaches this process rather than the child, so it has to be
-    // passed on or the TUI stops reflowing.
+    // passed on or the TUI stops reflowing. Ctrl+\ likewise, or it would kill
+    // the launcher and leave the child running against a terminal the shell has
+    // taken back.
     assert.ok(plan.forward.includes('SIGWINCH'), `${platform} leaves the child blind to a resize`);
+    assert.ok(plan.forward.includes('SIGQUIT'), `${platform} lets Ctrl+\\ orphan the child`);
+    // Ctrl+Z stops both, and `fg` resumes both.
+    assert.deepEqual(plan.suspend, ['SIGTSTP'], `${platform} stops the launcher and leaves the child running`);
+    assert.ok(plan.forward.includes('SIGCONT'), `${platform} resumes without waking the child`);
+    // SIGTSTP is never forwarded as itself: an orphaned group discards it.
+    assert.ok(!plan.forward.includes('SIGTSTP'));
     assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
   }
 
@@ -1065,7 +1098,7 @@ test('the child owns its process group, so every signal is forwarded once', () =
   // a single process; its console has already given Ctrl+C to the child, so it
   // is absorbed to keep this process alive until the proxy is closed.
   assert.equal(spawnOptions('win32').detached, false);
-  assert.deepEqual(signalPlan('win32'), { absorb: ['SIGINT', 'SIGBREAK'], forward: [] });
+  assert.deepEqual(signalPlan('win32'), { absorb: ['SIGINT', 'SIGBREAK'], forward: [], suspend: [] });
   assert.equal(spawnOptions('linux').stdio, 'inherit');
 });
 
