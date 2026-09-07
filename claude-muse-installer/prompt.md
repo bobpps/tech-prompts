@@ -603,6 +603,13 @@ async function startProxy(upstream, token, idleSeconds) {
     }
     const abort = new AbortController();
     res.on('close', () => { if (!res.writableFinished) abort.abort(); });
+    // The signal reaches `fetch`, but a client that stalls halfway through its
+    // upload never gets that far: the read loop below would park on a socket
+    // that stays open and simply never speaks again, and nothing would observe
+    // the abort. Destroying the request makes that read throw instead, so
+    // silence is abandoned wherever in the turn it happens. A request that was
+    // read to the end is already complete, so this leaves it alone.
+    abort.signal.addEventListener('abort', () => req.destroy(), { once: true });
     let timer;
     const active = () => {
       clearTimeout(timer);
@@ -828,6 +835,8 @@ Create `~/.local/lib/claude-muse/adapter.test.cjs` with this exact content:
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const net = require('node:net');
+const { once } = require('node:events');
 const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
@@ -965,6 +974,34 @@ test('the request timer measures silence, not elapsed time', async () => {
     const silent = await fetch(proxy.url + '/v1/silent', { method: 'POST', headers, body: '{}' });
     assert.equal(silent.status, 502);
   } finally {
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('an upload that stalls mid-body is abandoned too', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{}');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key', 0.15);
+  const socket = net.connect(Number(new URL(proxy.url).port), '127.0.0.1');
+  try {
+    await once(socket, 'connect');
+    // The headers promise 4096 bytes, two arrive, and the client then holds the
+    // connection open without sending the rest or closing it.
+    socket.write(
+      'POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n' +
+      'authorization: Bearer ' + proxy.token + '\r\n' +
+      'content-type: application/json\r\ncontent-length: 4096\r\n\r\n{}'
+    );
+    const closed = await Promise.race([
+      once(socket, 'close').then(() => true),
+      new Promise(resolve => setTimeout(resolve, 2000, false)),
+    ]);
+    assert.ok(closed, 'the stalled upload was held open past the idle window');
+  } finally {
+    socket.destroy();
     proxy.server.closeAllConnections(); proxy.server.close();
     upstream.closeAllConnections(); upstream.close();
   }
@@ -1271,8 +1308,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are fourteen offline tests in total: six in `adapter.test.cjs` and eight
-in `launcher.test.cjs`. All fourteen must pass on both platforms; four of them
+There are fifteen offline tests in total: seven in `adapter.test.cjs` and eight
+in `launcher.test.cjs`. All fifteen must pass on both platforms; four of them
 exercise the Windows program-resolution logic against realistic npm shims and
 run correctly on POSIX as well. Report the count you actually observed.
 

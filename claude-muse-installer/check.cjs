@@ -152,6 +152,16 @@ for (const [name, file] of written) {
   }
 }
 
+// Node 23 changed the default reporter on a non-TTY stdout from `tap` to
+// `spec`, so the summary arrives as `# pass 8` on an older runtime and
+// `ℹ pass 8` on a newer one. Both are read here rather than pinning
+// `--test-reporter=tap`, a flag that only exists from Node 18.15 and would fail
+// on the oldest runtime this prompt supports.
+function summary(output, field) {
+  const match = output.match(new RegExp(`^(?:# |ℹ )${field} (\\d+)$`, 'm'));
+  return match ? Number(match[1]) : -1;
+}
+
 // Each test file is run on its own so the per-file counts the prose quotes can
 // be checked, not just the total.
 const counts = new Map();
@@ -161,11 +171,13 @@ for (const [name, file] of written) {
   try {
     output = node(['--test', file]);
   } catch (error) {
+    // Printed whole. Which lines carry the failure is reporter-specific, and a
+    // filter that guesses wrong here reports a failing suite as an empty list.
     output = (error.stdout || '') + (error.stderr || '');
-    fail(`${name} has failing tests:\n${output.split('\n').filter(line => /^not ok/.test(line)).join('\n')}`);
+    fail(`${name} has failing tests:\n${output.trim()}`);
   }
-  const passed = Number((output.match(/^# pass (\d+)$/m) || [])[1] ?? -1);
-  const failed = Number((output.match(/^# fail (\d+)$/m) || [])[1] ?? -1);
+  const passed = summary(output, 'pass');
+  const failed = summary(output, 'fail');
   if (passed < 0 || failed < 0) fail(`could not read the test summary for ${name}`);
   else {
     counts.set(name, passed);
@@ -175,7 +187,7 @@ for (const [name, file] of written) {
 
 // ---------------------------------------------------------------- prose
 
-// "There are fourteen offline tests in total: six in `adapter.test.cjs` and
+// "There are fifteen offline tests in total: seven in `adapter.test.cjs` and
 // eight in `launcher.test.cjs`." Prose that drifts from the code is how a
 // reader stops trusting either.
 const prose = lines.join(' ').replace(/\s+/g, ' ');
