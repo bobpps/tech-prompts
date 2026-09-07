@@ -518,52 +518,60 @@ function exitStatus(code, signal) {
   return number ? 128 + number : 143;
 }
 
-// How the child is started. On POSIX it gets its own process group, which is
-// what makes the signal rules below decidable at all: the terminal then
-// delivers Ctrl+C and a hangup to this process only, so exactly one copy
-// reaches Claude Code — the one forwarded below — whether the signal came from
-// the terminal or from a `kill` aimed at this pid. Reading delivery scope off
-// the environment instead is guesswork: nothing in Node says who sent a signal,
-// and an inherited terminal looks identical in both cases.
+// How the child is started. Never `detached`, on any platform: the child stays
+// in this process group, inside the job the shell controls.
 //
-// `detached` starts a new session, so the child no longer has this terminal as
-// its controlling terminal. It keeps the inherited descriptors and can still
-// read, write and set raw mode on them: SIGTTIN and SIGTTOU are raised for
-// background groups of the session that owns the terminal, and the child is no
-// longer in that session at all.
-function spawnOptions(platform = process.platform) {
-  return { stdio: 'inherit', detached: platform !== 'win32' };
+// Detaching it is tempting, because then the terminal signals this process
+// alone and every signal can be forwarded without asking who sent it. The
+// price is job control, all of it. A detached child's process group is orphaned
+// by definition — its only parent is in another session — and POSIX discards
+// stop signals sent to an orphaned group, so Ctrl+Z stops the launcher and
+// leaves Claude Code running. Emulating that with SIGSTOP works, but the shell
+// sends the same SIGCONT for `bg` as for `fg`, and nothing distinguishes them,
+// so `bg` resumes a child that then fights the shell for the terminal — while
+// SIGTTIN and SIGTTOU, the protection that normally prevents exactly this, do
+// not apply to a process outside the terminal's session.
+//
+// In this group instead, the kernel does all of it correctly and for free:
+// Ctrl+Z stops both, `fg` and `bg` behave, Ctrl+\ takes both down, and a resize
+// reaches the child directly. What that costs is knowing who sent a SIGINT,
+// which is what signalPlan below is about.
+function spawnOptions() {
+  return { stdio: 'inherit' };
 }
 
-// Which signals this process absorbs, which it passes on, and which suspend the
-// pair.
+// True when a terminal is attached to any of the three standard streams — as
+// close as Node gets to "there is a controlling terminal that could be signalling
+// my process group". Any one of them is enough: Ctrl+C goes to the foreground
+// process group whatever this process has done with its own descriptors, so
+// `claude-muse -p x < input` in a terminal still counts.
+function hasTerminal() {
+  return ['stdin', 'stdout', 'stderr'].some(stream => process[stream] && process[stream].isTTY);
+}
+
+// Which signals this process absorbs and which it passes on. Only the two the
+// terminal can generate are in question; everything else the kernel already
+// delivers to the whole group, which is where the child is.
 //
-// On POSIX everything the terminal can produce is forwarded, because with the
-// child in its own group nothing else reaches it: absorbing would leave a
-// cancelled run running, with the launcher declining to die, Claude Code never
-// told, and the proxy up. SIGWINCH is in the list for the same reason — a
-// resize goes to the terminal's foreground group, which is now this process,
-// and a TUI that never hears about it stops reflowing. SIGQUIT is there because
-// Ctrl+\ would otherwise kill the launcher and leave the child running against
-// a terminal the shell has taken back.
+// With a terminal attached, Ctrl+C and a hangup have reached the child already.
+// Forwarding would hand Claude Code a second copy, and it reads a second SIGINT
+// as "force quit", so one Ctrl+C would cancel twice. They are absorbed instead,
+// which also keeps this process alive to close the proxy after the child exits.
 //
-// SIGTSTP cannot simply be forwarded: a detached child's process group is
-// orphaned by definition — its only parent is in another session — and POSIX
-// discards stop signals sent to an orphaned group, so the child would keep
-// running while the launcher stopped. That is what `suspend` is for, and why it
-// is a separate list rather than another entry in `forward`.
+// With no terminal anywhere — a supervisor, a CI step, a script — nothing can be
+// generating them for the group, so a signal that arrives was aimed at this pid
+// alone and the child has not seen it. Absorbing there would leave a cancelled
+// run running, so they are forwarded.
 //
-// Windows has no process groups to arrange and no way to send one of these to a
-// single process; its console delivers Ctrl+C to the child already, so those
-// are absorbed to keep this process alive long enough to close the proxy.
-function signalPlan(platform = process.platform) {
-  return platform === 'win32'
-    ? { absorb: ['SIGINT', 'SIGBREAK'], forward: [], suspend: [] }
-    : {
-      absorb: [],
-      forward: ['SIGINT', 'SIGHUP', 'SIGTERM', 'SIGQUIT', 'SIGWINCH', 'SIGCONT'],
-      suspend: ['SIGTSTP'],
-    };
+// What stays undecidable is a supervisor that inherits a terminal and signals by
+// pid: that reads as the terminal case and is absorbed. Nothing in Node says who
+// sent a signal. SIGTERM is never terminal-generated and is always forwarded,
+// which is why it is the documented way to cancel a run by pid.
+function signalPlan(platform = process.platform, terminal = hasTerminal()) {
+  if (platform === 'win32') return { absorb: ['SIGINT', 'SIGBREAK'], forward: [] };
+  return terminal
+    ? { absorb: ['SIGINT', 'SIGHUP'], forward: ['SIGTERM'] }
+    : { absorb: [], forward: ['SIGINT', 'SIGHUP', 'SIGTERM'] };
 }
 
 async function main() {
@@ -597,18 +605,6 @@ async function main() {
   const plan = signalPlan();
   for (const signal of plan.absorb) process.on(signal, () => {});
   for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
-  for (const signal of plan.suspend) {
-    process.on(signal, () => {
-      // SIGSTOP, not the signal that arrived: a stop signal is discarded when it
-      // lands on an orphaned process group, and SIGSTOP is not one of those.
-      // Stop the child first, so nothing writes to a terminal the shell has
-      // taken back, then stop this process — SIGSTOP again, since re-raising
-      // SIGTSTP would only re-enter this handler. `fg` sends SIGCONT here, and
-      // the forward list passes it on, so the pair resumes together.
-      child.kill('SIGSTOP');
-      process.kill(process.pid, 'SIGSTOP');
-    });
-  }
 }
 
 module.exports = {
@@ -1069,37 +1065,43 @@ test('PATHEXT decides which form wins inside a directory', () => {
   assert.deepEqual(claudeNames('.CMD;.EXE'), ['claude.cmd', 'claude.exe', 'claude.com', 'claude.ps1']);
 });
 
-test('the child owns its process group, so every signal is forwarded once', () => {
+test('the child stays in the shell-controlled job, and terminal signals are not doubled', () => {
+  // Detaching would put the child outside the terminal's session, where the
+  // kernel stops doing job control for it and SIGTTIN/SIGTTOU stop protecting
+  // the shell from it. Job control is worth more than knowing who sent a signal.
+  assert.equal(spawnOptions().detached, undefined, 'the child left the shell-controlled job');
+  assert.equal(spawnOptions().stdio, 'inherit');
+
+  // The terminal flag is always passed here: read from the real process, this
+  // would assert something different under a test runner than under a terminal.
+  for (const platform of ['linux', 'darwin', 'win32']) {
+    const plan = signalPlan(platform, true);
+    // Ctrl+C and a hangup reach the whole foreground process group, so the child
+    // has them already; forwarding would deliver a second SIGINT, which Claude
+    // Code takes as a force quit.
+    for (const signal of ['SIGINT', 'SIGHUP', 'SIGBREAK']) {
+      assert.ok(!plan.forward.includes(signal), `${platform} forwards ${signal} the child already got`);
+    }
+    assert.ok(plan.absorb.includes('SIGINT'), `${platform} lets SIGINT kill the launcher before the proxy closes`);
+    assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
+  }
+  // Everything else — SIGWINCH, SIGQUIT, SIGTSTP, SIGCONT — is left to the
+  // kernel, which delivers it to the whole group, the child included.
+  assert.deepEqual(signalPlan('linux', true).forward, ['SIGTERM']);
+
+  // With no terminal anywhere, nothing can be signalling the group: what arrives
+  // was aimed at this pid alone, so absorbing it would leave a cancelled run
+  // still running.
   for (const platform of ['linux', 'darwin']) {
-    // Its own group is what makes forwarding safe: the terminal delivers to the
-    // launcher alone, so the copy the child gets is the one sent here, and a
-    // signal aimed at this pid arrives the same way.
-    assert.equal(spawnOptions(platform).detached, true, `${platform} leaves the child in this process group`);
-    const plan = signalPlan(platform);
-    assert.deepEqual(plan.absorb, [], `${platform} swallows a signal the child will never see`);
+    const plan = signalPlan(platform, false);
+    assert.deepEqual(plan.absorb, [], `${platform} still swallows a signal only this process got`);
     for (const signal of ['SIGINT', 'SIGHUP', 'SIGTERM']) {
       assert.ok(plan.forward.includes(signal), `${platform} drops ${signal} instead of passing it on`);
     }
-    // A resize now reaches this process rather than the child, so it has to be
-    // passed on or the TUI stops reflowing. Ctrl+\ likewise, or it would kill
-    // the launcher and leave the child running against a terminal the shell has
-    // taken back.
-    assert.ok(plan.forward.includes('SIGWINCH'), `${platform} leaves the child blind to a resize`);
-    assert.ok(plan.forward.includes('SIGQUIT'), `${platform} lets Ctrl+\\ orphan the child`);
-    // Ctrl+Z stops both, and `fg` resumes both.
-    assert.deepEqual(plan.suspend, ['SIGTSTP'], `${platform} stops the launcher and leaves the child running`);
-    assert.ok(plan.forward.includes('SIGCONT'), `${platform} resumes without waking the child`);
-    // SIGTSTP is never forwarded as itself: an orphaned group discards it.
-    assert.ok(!plan.forward.includes('SIGTSTP'));
-    assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
   }
-
-  // Windows has no process groups to arrange and no way to send one of these to
-  // a single process; its console has already given Ctrl+C to the child, so it
-  // is absorbed to keep this process alive until the proxy is closed.
-  assert.equal(spawnOptions('win32').detached, false);
-  assert.deepEqual(signalPlan('win32'), { absorb: ['SIGINT', 'SIGBREAK'], forward: [], suspend: [] });
-  assert.equal(spawnOptions('linux').stdio, 'inherit');
+  // Windows has no process groups to reason about and no way to send one of
+  // these to a single process, so it does not change with the terminal.
+  assert.deepEqual(signalPlan('win32', false), signalPlan('win32', true));
 });
 
 test('PATH order decides, not file extension: an early shim beats a later exe', () => {
