@@ -562,20 +562,34 @@ class ToolNames {
 // Claude Code adds `ttl` and `scope` extensions when it believes it may use the
 // extended cache. Reducing the object to its type downgrades to the provider's
 // default cache instead of failing the whole request with HTTP 400.
-function plainCacheControl(node) {
-  if (!node || typeof node !== 'object') return node;
-  if (Array.isArray(node)) {
-    for (const item of node) plainCacheControl(item);
-    return node;
-  }
-  for (const [key, value] of Object.entries(node)) {
-    if (key === 'cache_control' && value && typeof value === 'object' && !Array.isArray(value)) {
+// Only the four places the API allows the field is it ours to touch: a tool
+// definition, a system block, a message content block, and the content blocks
+// inside a tool_result. Everything else — a tool's `input_schema`, the `input`
+// of a past tool_use — is application data, where a field named cache_control
+// belongs to that tool and means whatever the tool says it means. Walking the
+// whole body would silently reduce an MCP schema property of that name to
+// `{"type": ...}`, dropping its own `properties` and `description` on the way
+// through, and the tool would then be described wrongly to the model.
+function plainCacheControl(body) {
+  if (!body || typeof body !== 'object') return body;
+  const reduce = holder => {
+    const value = holder && holder.cache_control;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
       for (const extra of Object.keys(value)) if (extra !== 'type') delete value[extra];
-    } else {
-      plainCacheControl(value);
     }
-  }
-  return node;
+  };
+  const blocks = content => {
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      reduce(block);
+      if (block.type === 'tool_result') blocks(block.content);
+    }
+  };
+  blocks(body.system);
+  if (Array.isArray(body.tools)) for (const tool of body.tools) reduce(tool);
+  if (Array.isArray(body.messages)) for (const message of body.messages) blocks(message && message.content);
+  return body;
 }
 
 // A request this adapter refuses to forward, reported to Claude Code as a 400
@@ -1015,6 +1029,35 @@ test('cache_control keeps only its type, everywhere it can appear', () => {
   assert.deepEqual(plainCacheControl({ cache_control: null }), { cache_control: null });
 });
 
+test('a tool that has a cache_control of its own keeps it', () => {
+  // An MCP tool is free to take an argument called cache_control. Its schema and
+  // the inputs of past calls are the tool's data, not protocol metadata: rewrite
+  // them and the model is handed a tool description that no longer matches the
+  // tool.
+  const schema = {
+    type: 'object',
+    properties: {
+      cache_control: { type: 'object', description: 'passed through to the API', properties: { ttl: { type: 'string' } } },
+    },
+    required: ['cache_control'],
+  };
+  // Compared against a copy taken now: the function mutates in place, so
+  // asserting against `schema` itself would pass however badly it was mangled.
+  const untouched = JSON.parse(JSON.stringify(schema));
+  const body = plainCacheControl({
+    tools: [{ name: 'anthropic_request', input_schema: schema, cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    messages: [{ content: [
+      { type: 'tool_use', name: 'anthropic_request', input: { cache_control: { type: 'ephemeral', ttl: '1h', note: 'kept' } } },
+      { type: 'tool_result', content: [{ type: 'text', text: 'ok' }] },
+    ] }],
+  });
+  // The tool definition's own cache_control is protocol metadata and is reduced.
+  assert.deepEqual(body.tools[0].cache_control, { type: 'ephemeral' });
+  // Everything below it is not.
+  assert.deepEqual(body.tools[0].input_schema, untouched);
+  assert.deepEqual(body.messages[0].content[0].input.cache_control, { type: 'ephemeral', ttl: '1h', note: 'kept' });
+});
+
 test('web_search keeps only the fields Meta accepts; domain filters are refused', () => {
   const body = webSearchTools({
     tools: [
@@ -1411,8 +1454,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are eighteen offline tests in total: seven in `adapter.test.cjs` and
-eleven in `launcher.test.cjs`. All eighteen must pass on both platforms; five of
+There are nineteen offline tests in total: eight in `adapter.test.cjs` and
+eleven in `launcher.test.cjs`. All nineteen must pass on both platforms; five of
 them exercise the Windows program-resolution logic against realistic npm shims
 and run correctly on POSIX as well. Report the count you actually observed.
 
