@@ -408,6 +408,21 @@ function resolveClaude(windows = WINDOWS, pathValue = process.env.PATH || '') {
     : { file: target, prefix: [] };
 }
 
+// Which signals this process absorbs and which it passes on. The child shares
+// this process group, so anything the terminal generates — Ctrl+C, a hangup —
+// is delivered to both of us by the kernel: forwarding it would hand Claude
+// Code a second copy, and Claude Code reads a second SIGINT as "force quit", so
+// one Ctrl+C would cancel twice. Those are absorbed instead, exactly as on
+// Windows, leaving this process alive to close the proxy after the child exits.
+// SIGTERM is not terminal-generated — it only arrives from an explicit kill
+// aimed at this process — so it is the one signal the child has not already
+// received, and the one worth forwarding.
+function signalPlan(platform = process.platform) {
+  return platform === 'win32'
+    ? { absorb: ['SIGINT', 'SIGBREAK'], forward: [] }
+    : { absorb: ['SIGINT', 'SIGHUP'], forward: ['SIGTERM'] };
+}
+
 async function main() {
   const config = loadConfig();
   const target = resolveClaude();
@@ -436,18 +451,14 @@ async function main() {
   };
   child.on('error', () => { console.error('Unable to start Claude Code.'); finish(1); });
   child.on('exit', (code, signal) => finish(code ?? (signal === 'SIGINT' ? 130 : 143)));
-  if (WINDOWS) {
-    // The console already delivered Ctrl+C to the child. Absorb it here so this
-    // process outlives the child and still closes the proxy.
-    for (const signal of ['SIGINT', 'SIGBREAK']) process.on(signal, () => {});
-  } else {
-    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
-  }
+  const plan = signalPlan();
+  for (const signal of plan.absorb) process.on(signal, () => {});
+  for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
 }
 
 module.exports = {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, SCRUB, DEFAULTS,
+  findOnPath, targetFromShim, resolveClaude, signalPlan, SCRUB, DEFAULTS,
 };
 
 if (require.main === module) {
@@ -699,7 +710,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude,
+  findOnPath, targetFromShim, resolveClaude, signalPlan,
 } = require('./launcher.cjs');
 
 const KEY = 'LLM|1234567890|abcdefg_hijklmn';
@@ -826,6 +837,24 @@ test('a real claude.exe on PATH wins, and an unreadable shim yields nothing', ()
   fs.writeFileSync(path.join(empty, 'claude.cmd'), 'echo nothing useful here\r\n');
   assert.equal(targetFromShim(path.join(empty, 'claude.cmd')), null);
   assert.equal(resolveClaude(true, empty), null);
+});
+
+test('no terminal signal is forwarded, on either platform', () => {
+  for (const platform of ['linux', 'darwin', 'win32']) {
+    const plan = signalPlan(platform);
+    // Ctrl+C and a hangup reach the whole foreground process group, so the child
+    // has them already; forwarding would deliver a second SIGINT, which Claude
+    // Code takes as a force quit.
+    for (const signal of ['SIGINT', 'SIGHUP', 'SIGBREAK']) {
+      assert.ok(!plan.forward.includes(signal), `${platform} forwards ${signal} the child already got`);
+    }
+    assert.ok(plan.absorb.includes('SIGINT'), `${platform} lets SIGINT kill the launcher before the proxy closes`);
+    assert.equal(plan.absorb.filter(signal => plan.forward.includes(signal)).length, 0);
+  }
+  // SIGTERM arrives only from a kill aimed at this process, so it is the one the
+  // child has not seen.
+  assert.deepEqual(signalPlan('linux').forward, ['SIGTERM']);
+  assert.deepEqual(signalPlan('win32').forward, []);
 });
 ```
 
@@ -1308,8 +1337,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are fifteen offline tests in total: seven in `adapter.test.cjs` and eight
-in `launcher.test.cjs`. All fifteen must pass on both platforms; four of them
+There are sixteen offline tests in total: seven in `adapter.test.cjs` and nine
+in `launcher.test.cjs`. All sixteen must pass on both platforms; four of them
 exercise the Windows program-resolution logic against realistic npm shims and
 run correctly on POSIX as well. Report the count you actually observed.
 
