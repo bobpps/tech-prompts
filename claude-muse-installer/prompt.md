@@ -54,6 +54,12 @@ cygpath -u "$(node -p "require('os').homedir()")"   # /c/Users/you — MSYS, for
 - In the launcher shim, where the path is one argument handed straight to Node,
   write the native path exactly as Node reported it.
 
+This governs the files this prompt installs. The shell's own startup file is not
+one of them: it belongs to the shell and stays where the shell looks for it,
+under the shell's `$HOME`. Written under the Node-reported home instead, bash
+would never read it and a fresh terminal would still not find `claude-muse`.
+Only the path written inside that file points at the installed tree.
+
 State the substitution, and both spellings, in the final report.
 
 The layout below is identical on every platform except the launcher's file
@@ -99,17 +105,28 @@ First inspect the environment:
    On POSIX, determine the user's login shell first and write to that shell's
    startup file, in that shell's own syntax. Name the file you chose.
 
-   Under zsh, the default on macOS, that is `~/.zshrc`; under bash it is
-   `~/.bash_profile` for a login shell, otherwise `~/.bashrc`:
+   Under zsh, the default on macOS, that is `~/.zshrc`.
+
+   Under bash, append to the file bash already reads, and never create one that
+   shadows another. For a login shell that is the first of `~/.bash_profile`,
+   `~/.bash_login` and `~/.profile` that exists; create `~/.bash_profile` only
+   when none of the three does. Creating it next to an existing `~/.profile`
+   would silently stop every line of that file from running at login, because
+   bash reads only the first of the three it finds. For an interactive non-login
+   shell the file is `~/.bashrc`. Report which file you chose and whether it
+   already existed.
 
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
    ```
 
-   Under Git Bash with a divergent `$HOME`, substitute the MSYS spelling of the
-   Node-reported home for `$HOME` here — `export PATH="/c/Users/you/.local/bin:$PATH"`
-   — never the native `C:\Users\you`, whose colon bash would read as a `PATH`
-   separator.
+   Under Git Bash with a divergent `$HOME`, two homes meet in this one step. The
+   startup file itself belongs to the shell, so it stays under the shell's
+   `$HOME`, where bash actually looks for it — not under the Node-reported home,
+   even though everything installed lives there. The path inside the line points
+   at the installed tree, so write the MSYS spelling of the Node-reported home:
+   `export PATH="/c/Users/you/.local/bin:$PATH"`. Never the native
+   `C:\Users\you`, whose colon bash would read as a `PATH` separator.
 
    Under fish, `export` is not valid syntax and the file is
    `~/.config/fish/config.fish`. `fish_add_path` is idempotent by itself:
