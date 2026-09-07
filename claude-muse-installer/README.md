@@ -5,7 +5,7 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs thirteen offline
+detects the platform once and follows only that branch; it writes the files, runs fourteen offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
@@ -24,9 +24,9 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
 ~/.local/lib/claude-muse/launcher.test.cjs   eight offline tests
-~/.local/lib/claude-muse/adapter.test.cjs    five offline tests
+~/.local/lib/claude-muse/adapter.test.cjs    six offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
-~/.config/claude-muse/provider.env   base URL, model, effort — and your key
+~/.config/claude-muse/provider.env   base URL, model, effort, idle timeout — and your key
 ```
 
 The launcher scrubs Anthropic and experimental variables out of the child environment, maps every
@@ -51,6 +51,14 @@ explanation. Remove the domain filter from your Claude Code settings, or turn We
 
 Meta's server-side search covers page fetches through the same tool; the separate
 `web_fetch_20250910` tool type is not supported by the provider at all.
+
+## Long turns
+
+A request is abandoned after `MUSE_IDLE_TIMEOUT_SECONDS` of complete silence, 300 by default.
+That is an idle timer, not a wall clock — every byte in either direction restarts it — so a
+high-effort turn over a large context streams for as long as it needs. A fixed cutoff would cut
+healthy streams off mid-answer, and after the response headers have been sent there is no way
+left to report an error, so the turn would just arrive truncated.
 
 Default effort is `high`, injected as a CLI argument, so `claude-muse --effort low` and the
 in-session `/effort` command still win.

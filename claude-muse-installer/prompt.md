@@ -165,6 +165,12 @@ MUSE_MODEL='muse-spark-1.3-contributor'
 # Muse has a 1,048,576-token window; automatic compaction remains enabled.
 MUSE_MAX_CONTEXT_TOKENS='1048576'
 MUSE_EFFORT='high'
+
+# Seconds of complete silence before the adapter gives up on a request. This is
+# an idle timer: any byte in either direction restarts it, so a long streaming
+# turn is never cut off. Raise it only if a stalled connection should be held
+# open longer.
+MUSE_IDLE_TIMEOUT_SECONDS='300'
 ```
 
 Do not enforce a particular textual format for the Meta key. Meta keys have
@@ -216,6 +222,7 @@ const DEFAULTS = {
   MUSE_EFFORT: 'high',
   MUSE_MAX_CONTEXT_TOKENS: '1048576',
   MUSE_CAPABILITIES: 'effort,thinking,adaptive_thinking,interleaved_thinking',
+  MUSE_IDLE_TIMEOUT_SECONDS: '300',
 };
 
 // Provider and experimental overrides that must not reach Claude Code.
@@ -380,7 +387,7 @@ async function main() {
       '  Install Claude Code so one of those exists, then run claude-muse again.'
     );
   }
-  const proxy = await startProxy(config.MUSE_BASE_URL, config.MUSE_AUTH_TOKEN);
+  const proxy = await startProxy(config.MUSE_BASE_URL, config.MUSE_AUTH_TOKEN, config.MUSE_IDLE_TIMEOUT_SECONDS);
   const env = buildChildEnv(process.env, config);
   env.ANTHROPIC_BASE_URL = proxy.url;
   env.ANTHROPIC_AUTH_TOKEN = proxy.token;
@@ -534,10 +541,16 @@ function sseFrame(frame, names) {
   return [...lines.filter(l => !l.startsWith('data:')), 'data: ' + JSON.stringify(body)].join('\n');
 }
 
-async function startProxy(upstream, token) {
+async function startProxy(upstream, token, idleSeconds) {
   const origin = new URL(upstream);
   const localToken = randomBytes(32).toString('hex');
   const names = new ToolNames();
+  // Idle, not wall-clock. A high-effort turn over a large context can stream for
+  // far longer than any fixed cutoff, and aborting a healthy stream mid-flight
+  // would truncate the turn: the headers have already gone out, so there is no
+  // way left to report an error. Every byte in either direction restarts this,
+  // which leaves it measuring only genuine silence.
+  const idleMs = Number(idleSeconds) > 0 ? Number(idleSeconds) * 1000 : 300000;
   const server = http.createServer(async (req, res) => {
     if (req.headers.authorization !== 'Bearer ' + localToken) {
       res.writeHead(401).end();
@@ -549,11 +562,17 @@ async function startProxy(upstream, token) {
     }
     const abort = new AbortController();
     res.on('close', () => { if (!res.writableFinished) abort.abort(); });
-    const timer = setTimeout(() => abort.abort(), 300000);
+    let timer;
+    const active = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => abort.abort(), idleMs);
+    };
+    active();
     try {
       const chunks = [];
       let size = 0;
       for await (const chunk of req) {
+        active();
         size += chunk.length;
         if (size > 64 * 1024 * 1024) { res.writeHead(413).end(); return; }
         chunks.push(chunk);
@@ -573,6 +592,7 @@ async function startProxy(upstream, token) {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
         body: raw ? JSON.stringify(plainCacheControl(webSearchTools(names.request(JSON.parse(raw))))) : undefined,
       });
+      active();
       res.statusCode = response.status;
       for (const [key, value] of response.headers) {
         if (!['content-length', 'content-encoding', 'transfer-encoding', 'connection'].includes(key)) res.setHeader(key, value);
@@ -581,6 +601,7 @@ async function startProxy(upstream, token) {
         const decoder = new TextDecoder();
         let buffer = '';
         for await (const chunk of response.body) {
+          active();
           buffer += decoder.decode(chunk, { stream: true });
           let match;
           while ((match = /\r?\n\r?\n/.exec(buffer))) {
@@ -863,11 +884,43 @@ test('web_search keeps only the fields Meta accepts; domain filters are refused'
     );
   }
 });
+
+test('the request timer measures silence, not elapsed time', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    if (req.url.endsWith('/silent')) return;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // Six frames 40 ms apart: 240 ms in total, well past the 150 ms idle limit,
+    // with no gap longer than it.
+    for (let i = 0; i < 6; i++) {
+      await new Promise(resolve => setTimeout(resolve, 40));
+      res.write('data: ' + JSON.stringify({ type: 'ping', i }) + '\n\n');
+    }
+    res.end();
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key', 0.15);
+  const headers = { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' };
+  try {
+    const started = Date.now();
+    const streamed = await (await fetch(proxy.url + '/v1/messages', { method: 'POST', headers, body: '{}' })).text();
+    assert.equal(streamed.match(/data: /g).length, 6);
+    assert.ok(Date.now() - started > 150, 'the stream outlived the idle window');
+    // A connection that goes quiet is still abandoned.
+    const silent = await fetch(proxy.url + '/v1/silent', { method: 'POST', headers, body: '{}' });
+    assert.equal(silent.status, 502);
+  } finally {
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
 ```
 
-Create `~/.local/lib/claude-muse/README.md` with this exact content:
+Create `~/.local/lib/claude-muse/README.md` with this exact content. The block
+is fenced with four backticks because the file itself contains fenced blocks;
+everything up to the closing four-backtick line belongs in the file:
 
-```markdown
+````markdown
 # Claude Muse compatibility adapter
 
 `claude-muse` starts `launcher.cjs`, which reads the private provider
@@ -914,6 +967,15 @@ your Claude Code settings, or turn the WebSearch tool off.
 
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
+
+## Long turns
+
+The adapter gives up on a request after `MUSE_IDLE_TIMEOUT_SECONDS` of complete
+silence, 300 by default. It is an idle timer, not a wall clock: every byte in
+either direction restarts it, so a high-effort turn over a large context can
+stream for as long as it needs. A fixed cutoff would be worse than useless here
+— once the response headers have gone out there is no way left to report an
+error, so the turn would simply arrive truncated.
 
 ## Where the key lives
 
@@ -1020,7 +1082,7 @@ node --test ~/.local/lib/claude-muse/adapter.test.cjs ~/.local/lib/claude-muse/l
 Restart `claude-muse` after updating the adapter. Existing sessions keep the
 adapter process they started with. Browser or MCP authentication failures are
 separate from API tool-name validation; this adapter does not alter MCP servers.
-```
+````
 
 Why the launcher is Node and not a shell script:
 
@@ -1154,8 +1216,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirteen offline tests in total: five in `adapter.test.cjs` and eight
-in `launcher.test.cjs`. All thirteen must pass on both platforms; four of them
+There are fourteen offline tests in total: six in `adapter.test.cjs` and eight
+in `launcher.test.cjs`. All fourteen must pass on both platforms; four of them
 exercise the Windows program-resolution logic against realistic npm shims and
 run correctly on POSIX as well. Report the count you actually observed.
 
