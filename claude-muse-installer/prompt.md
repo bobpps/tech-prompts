@@ -45,13 +45,23 @@ node -p "require('os').homedir()"        # C:\Users\you   — native, for Node
 cygpath -u "$(node -p "require('os').homedir()")"   # /c/Users/you — MSYS, for the shell
 ```
 
-- Anywhere the shell itself reads the path — the `PATH` line added to the
-  startup file, and every command you run from a shell below, the verification
-  commands and the editor invocation included — use the MSYS form. A native
+- Anywhere the shell itself reads the path, it needs the MSYS form. A native
   path cannot go on `PATH`: bash splits on the colon, so `C:\Users\you\.local\bin`
   becomes the two useless entries `C` and `\Users\you\.local\bin`, and a fresh
   terminal never finds `claude-muse`. If `cygpath` is unavailable, the
   conversion is mechanical: `C:\Users\you` is `/c/Users/you`.
+- For the commands you run yourself — the verification commands, the editor
+  invocation — do not paste that path into them. Set it once, at the start of
+  the shell session, and use `"$muse_home"` wherever the blocks below say
+  `"$HOME"`:
+
+  ```bash
+  muse_home="$(cygpath -u "$(node -p "require('os').homedir()")")"
+  ```
+
+  A value that arrives through a variable is used as it stands; a value typed
+  into the command line is read by bash first, and `$`, a backtick and a quote
+  are all legal in a Windows profile path.
 - The launcher shim takes no substituted path at all. It resolves the home at
   run time, the same way the launcher itself does. A path pasted into its `exec`
   line would have to survive bash's own quoting rules, and Windows allows `$`, a
@@ -130,9 +140,25 @@ First inspect the environment:
    startup file itself belongs to the shell, so it stays under the shell's
    `$HOME`, where bash actually looks for it — not under the Node-reported home,
    even though everything installed lives there. The path inside the line points
-   at the installed tree, so write the MSYS spelling of the Node-reported home:
-   `export PATH="/c/Users/you/.local/bin:$PATH"`. Never the native
-   `C:\Users\you`, whose colon bash would read as a `PATH` separator.
+   at the installed tree, so write the MSYS spelling of the Node-reported home —
+   never the native `C:\Users\you`, whose colon bash reads as a `PATH`
+   separator — and write it in single quotes, joined to the existing `PATH`
+   outside them:
+
+   ```bash
+   export PATH='/c/Users/you/.local/bin':"$PATH"
+   ```
+
+   This line is read afresh by every new terminal, so it is the one place a
+   pasted path has to survive bash's quoting rules for good; double quotes would
+   not let it. Windows permits `$` and a backtick in a profile directory, and
+   `"/c/Users/a$b/.local/bin"` becomes `/c/Users/a` the moment the file is
+   sourced, leaving `claude-muse` unfindable in a way that looks like the
+   install never ran. Single quotes suspend all of it. If the path itself
+   contains a single quote, close, escape and reopen — `'/c/Users/o'\''brien/…'`
+   — which is the one case single quotes cannot express directly. Resolving the
+   home in the startup file instead would mean starting Node in every new
+   terminal, which is too much to charge a shell for one `PATH` entry.
 
    Under fish, `export` is not valid syntax and the file is
    `~/.config/fish/config.fish`. `fish_add_path` is idempotent by itself:
