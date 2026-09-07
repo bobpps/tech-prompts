@@ -540,13 +540,26 @@ function spawnOptions() {
   return { stdio: 'inherit' };
 }
 
-// True when a terminal is attached to any of the three standard streams — as
-// close as Node gets to "there is a controlling terminal that could be signalling
-// my process group". Any one of them is enough: Ctrl+C goes to the foreground
-// process group whatever this process has done with its own descriptors, so
-// `claude-muse -p x < input` in a terminal still counts.
+// Whether this process has a controlling terminal. Opening `/dev/tty` succeeds
+// exactly when it does, and fails with ENXIO when it does not, which is the
+// question worth asking: Ctrl+C goes to the foreground process group of the
+// controlling terminal, whatever this process has done with its descriptors.
+function hasControllingTerminal(ttyPath = '/dev/tty') {
+  try {
+    fs.closeSync(fs.openSync(ttyPath, 'r'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// True when a terminal could be generating signals for this process group. A
+// stream that is a TTY settles it without a syscall; `isTTY` being false settles
+// nothing, because `claude-muse -p x </dev/null >out 2>err` from a terminal is
+// still in that terminal's foreground group and still gets Ctrl+C.
 function hasTerminal() {
-  return ['stdin', 'stdout', 'stderr'].some(stream => process[stream] && process[stream].isTTY);
+  return ['stdin', 'stdout', 'stderr'].some(stream => process[stream] && process[stream].isTTY)
+    || hasControllingTerminal();
 }
 
 // Which signals this process absorbs and which it passes on. Only the two the
@@ -609,7 +622,8 @@ async function main() {
 
 module.exports = {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, exitStatus, SCRUB, DEFAULTS,
+  findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan,
+  hasControllingTerminal, exitStatus, SCRUB, DEFAULTS,
 };
 
 if (require.main === module) {
@@ -894,7 +908,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
-  findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, exitStatus,
+  findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, hasControllingTerminal, exitStatus,
 } = require('./launcher.cjs');
 
 const KEY = 'LLM|1234567890|abcdefg_hijklmn';
@@ -1102,6 +1116,15 @@ test('the child stays in the shell-controlled job, and terminal signals are not 
   // Windows has no process groups to reason about and no way to send one of
   // these to a single process, so it does not change with the terminal.
   assert.deepEqual(signalPlan('win32', false), signalPlan('win32', true));
+
+  // Which branch is taken comes from opening the controlling terminal, not from
+  // isTTY: a redirected stream says nothing about whether Ctrl+C still arrives.
+  // The path is a parameter so both answers can be asserted anywhere.
+  const dir = tempDir();
+  const present = path.join(dir, 'tty');
+  fs.writeFileSync(present, '');
+  assert.equal(hasControllingTerminal(present), true);
+  assert.equal(hasControllingTerminal(path.join(dir, 'no-such-terminal')), false);
 });
 
 test('PATH order decides, not file extension: an early shim beats a later exe', () => {
