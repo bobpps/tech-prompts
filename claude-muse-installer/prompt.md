@@ -2410,10 +2410,19 @@ Muse starts at `high` effort. The launcher expresses this as a Claude Code
 can change the active session to `low`, `medium`, or `high`. Muse treats
 `xhigh` as `high`, so the launcher does not advertise `xhigh_effort`.
 
-Tool Search is disabled for Muse: deferred loading caused incorrect tool names
-and missing arguments in integration tests. MCP servers remain enabled and
-their schemas are loaded directly. This consumes more context than deferred
-loading. Qwen, ordinary Claude, and global plugin/MCP configuration are unchanged.
+Tool Search is disabled for Muse, and this adapter is the reason. `ToolSearch`
+names the tool it wants inside a tool input, and the adapter rewrites protocol
+metadata only, so that name is never un-aliased. The model reads a real name in
+the listing of deferred tools, which travels as message text; a tool whose
+qualified name exceeds 64 characters is aliased everywhere the adapter does
+rewrite, including the definition it is loaded under and the `tool_reference`
+inside the search result. So the search the model issues for that alias comes
+back `No matching deferred tools found`. A plain semantic query still returns
+results, which is what makes the failure hard to read from inside a session.
+Deferred loading also produced incorrect tool names and missing arguments in
+integration tests. MCP servers remain enabled and their schemas are loaded
+directly. This consumes more context than deferred loading. Qwen, ordinary
+Claude, and global plugin/MCP configuration are unchanged.
 
 The launcher declares a 1,048,576-token context window using
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, configured by `MUSE_MAX_CONTEXT_TOKENS` in
@@ -2464,11 +2473,21 @@ Why the local adapter is required:
   prior message history, and `allowed_callers`.
 - Do not solve this by disabling all plugins or MCP servers. The shared Claude
   Code setup must remain usable.
-- `ENABLE_TOOL_SEARCH=false` is deliberate. Deferred Tool Search initially
-  avoids sending long names, but when a long tool is loaded Meta still rejects
-  it. During integration tests Muse also generated incorrect `default.`-prefixed
-  names and omitted required arguments after deferred loading. Direct schema
-  loading was reliable after aliasing.
+- `ENABLE_TOOL_SEARCH=false` is deliberate, and the adapter is what settles it.
+  Deferred Tool Search initially avoids sending long names, but when a long tool
+  is loaded Meta still rejects it, so the alias is needed either way — and the
+  alias is what breaks the search. `ToolSearch` carries the tool it wants inside
+  a tool input, `select:<name>`, which Claude Code matches against the registry
+  it built before anything reached the adapter; tool inputs are the one thing
+  the adapter never rewrites. The model reads a real name in the listing of
+  deferred tools, which travels as message text and is not rewritten either,
+  while every place the adapter does rewrite — the definition a tool is loaded
+  under, and the `tool_reference` inside the search result — carries the alias.
+  So a `select:` quoting the listing succeeds, and the one quoting the
+  definition returns `No matching deferred tools found`. During integration
+  tests Muse also generated incorrect `default.`-prefixed names and omitted
+  required arguments after deferred loading. Direct schema loading was reliable
+  after aliasing.
 - Meta rejects `stop_sequences` with HTTP 400, and Claude Code sends it on the
   auto-mode safety classifier call. Without the adapter, auto mode cannot judge
   any gated tool and reports the model as unavailable instead.
