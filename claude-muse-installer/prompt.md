@@ -453,6 +453,28 @@ function debugTarget(args, dir = os.tmpdir(), now = Date.now()) {
   };
 }
 
+// A log the user asked for and did not get is worse than never having offered
+// the flag: the path is announced, the failure is reproduced, and the file that
+// was meant to explain it is empty or missing. `--muse-debug=<path>` can name a
+// destination this process cannot write - a directory that does not exist, one
+// it has no rights to - and every append in the adapter is deliberately silent,
+// because a diagnostic must never break the turn it exists to explain.
+//
+// So the destination is opened once here instead, and a path that cannot be
+// written stops the run. The run about to start is the one the user wanted
+// recorded; starting it blind wastes the reproduction, which is the expensive
+// part.
+function openDebugLog(target, append = fs.appendFileSync) {
+  try {
+    append(target, '');
+  } catch (error) {
+    throw new Error(
+      'cannot write the debug log to ' + target + ': ' + ((error && error.code) || (error && error.message)) + '\n' +
+      '  --muse-debug=<path> needs a path in a directory that exists and is writable.'
+    );
+  }
+}
+
 function claudeArgs(args, defaultEffort) {
   if (args.some(arg => arg === '--effort' || arg.startsWith('--effort='))) return args;
   return ['--effort', defaultEffort, ...args];
@@ -605,6 +627,13 @@ function signalPlan(platform = process.platform, terminal = hasControllingTermin
 }
 
 async function main() {
+  // Read here, acted on twice. The destination has to be opened before the
+  // proxy is listening: `main`'s catch only sets an exit code, so a throw past
+  // that point would leave the process alive on an open server. Publishing the
+  // path to the environment has to wait until after the child environment is
+  // built, further down, or Claude Code inherits it.
+  const debug = debugTarget(process.argv.slice(2));
+  if (debug.log) openDebugLog(debug.log);
   const config = loadConfig();
   const target = resolveClaude();
   if (!target) {
@@ -616,36 +645,50 @@ async function main() {
     );
   }
   const proxy = await startProxy(config.MUSE_BASE_URL, config.MUSE_AUTH_TOKEN, config.MUSE_IDLE_TIMEOUT_SECONDS);
-  const env = buildChildEnv(process.env, config);
-  env.ANTHROPIC_BASE_URL = proxy.url;
-  env.ANTHROPIC_AUTH_TOKEN = proxy.token;
-  // Read after the child environment is built, so the log stays a property of
-  // this process and Claude Code does not inherit it.
-  const debug = debugTarget(process.argv.slice(2));
-  if (debug.log) {
-    process.env.MUSE_DEBUG_LOG = debug.log;
-    console.error('claude-muse: request log -> ' + debug.log);
-  }
-  const args = [...target.prefix, ...claudeArgs(debug.args, config.MUSE_EFFORT)];
-  const child = spawn(target.file, args, { env, ...spawnOptions() });
+  // Everything past this point runs with a socket already listening, and this
+  // function's only caller turns a rejection into an exit code. A throw that
+  // left the server open would hold the event loop and hang the terminal
+  // instead of reporting the fault - which is why the debug destination is
+  // opened at the top of this function, where there is nothing yet to close.
+  // Closing here for anything that throws anyway makes that ordering a
+  // preference rather than the only thing standing between a mistyped path and
+  // a process that never exits.
+  try {
+    const env = buildChildEnv(process.env, config);
+    env.ANTHROPIC_BASE_URL = proxy.url;
+    env.ANTHROPIC_AUTH_TOKEN = proxy.token;
+    // Published after the child environment is built, so the log stays a property
+    // of this process and Claude Code does not inherit it. The path was already
+    // opened, so this announces a file that exists.
+    if (debug.log) {
+      process.env.MUSE_DEBUG_LOG = debug.log;
+      console.error('claude-muse: request log -> ' + debug.log);
+    }
+    const args = [...target.prefix, ...claudeArgs(debug.args, config.MUSE_EFFORT)];
+    const child = spawn(target.file, args, { env, ...spawnOptions() });
 
-  let finished = false;
-  const finish = code => {
-    if (finished) return;
-    finished = true;
+    let finished = false;
+    const finish = code => {
+      if (finished) return;
+      finished = true;
+      proxy.server.closeAllConnections();
+      proxy.server.close();
+      process.exitCode = code;
+    };
+    child.on('error', () => { console.error('Unable to start Claude Code.'); finish(1); });
+    child.on('exit', (code, signal) => finish(exitStatus(code, signal)));
+    const plan = signalPlan();
+    for (const signal of plan.absorb) process.on(signal, () => {});
+    for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
+  } catch (error) {
     proxy.server.closeAllConnections();
     proxy.server.close();
-    process.exitCode = code;
-  };
-  child.on('error', () => { console.error('Unable to start Claude Code.'); finish(1); });
-  child.on('exit', (code, signal) => finish(exitStatus(code, signal)));
-  const plan = signalPlan();
-  for (const signal of plan.absorb) process.on(signal, () => {});
-  for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
+    throw error;
+  }
 }
 
 module.exports = {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget,
+  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan,
   hasControllingTerminal, exitStatus, SCRUB, DEFAULTS,
 };
@@ -680,12 +723,32 @@ const fs = require('node:fs');
 // - `parseJson` and `errorSummary` below are what hold that line where a body
 // this file did not write passes through. The path is read on each call, so
 // setting it after this file is loaded still works.
+let reportedFault = null;
+
 function debugLog(entry) {
   const target = process.env.MUSE_DEBUG_LOG;
   if (!target) return;
   try {
     fs.appendFileSync(target, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
-  } catch { /* diagnostics must never break a turn */ }
+  } catch (error) {
+    // Never thrown: a diagnostic that breaks the turn it was meant to explain
+    // is worse than no diagnostic at all. Never silent either - a user told the
+    // log is being written, who then finds nothing in it, has been sent to look
+    // in the wrong place for the rest of the session.
+    //
+    // Said once per destination, not once per request: this runs three times a
+    // turn, and a full disk would otherwise bury the failure it is reporting.
+    // Writing is still attempted afterwards, because the entry worth having is
+    // usually the one that has not happened yet, and the condition may lift.
+    if (reportedFault !== target) {
+      reportedFault = target;
+      console.error(
+        'claude-muse: cannot write the request log to ' + target + ': ' +
+        ((error && error.code) || (error && error.message)) +
+        ' (further failures on this path are not reported)'
+      );
+    }
+  }
 }
 
 // `JSON.parse` quotes a window of its input in the error it throws, and every
@@ -1070,7 +1133,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget,
+  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, hasControllingTerminal, exitStatus,
 } = require('./launcher.cjs');
 
@@ -1081,6 +1144,25 @@ function tempDir() {
   test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+
+test('a debug log that cannot be written is refused before the run starts', () => {
+  const dir = tempDir();
+  const usable = path.join(dir, 'fine.log');
+  openDebugLog(usable);
+  // Opened, not merely tested for: the path the launcher is about to announce
+  // exists by the time it says so.
+  assert.equal(fs.existsSync(usable), true);
+  // An existing log is appended to, never truncated - two runs into one file
+  // keep both.
+  fs.writeFileSync(usable, 'earlier\n');
+  openDebugLog(usable);
+  assert.equal(fs.readFileSync(usable, 'utf8'), 'earlier\n');
+
+  assert.throws(
+    () => openDebugLog(path.join(dir, 'absent', 'x.log')),
+    error => /cannot write the debug log/.test(error.message) && /ENOENT/.test(error.message)
+  );
+});
 
 test('high is the default effort but an explicit CLI effort wins', () => {
   assert.deepEqual(claudeArgs(['-p', 'hello'], 'high'), ['--effort', 'high', '-p', 'hello']);
@@ -1574,6 +1656,44 @@ test('a malformed body is reported by name, never by an excerpt of itself', () =
     () => parseJson('{"messages":[{"content":"the content of a turn"}], "model": bad}', 'The request body'),
     error => error.message === 'The request body is not valid JSON'
   );
+});
+
+test('a debug log that cannot be written says so once and does not break the turn', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  // A directory that does not exist, which is what `--muse-debug=<path>` names
+  // when a user mistypes it or points at a drive that is not mounted.
+  process.env.MUSE_DEBUG_LOG = path.join(os.tmpdir(), 'muse-absent-' + process.pid, 'nested', 'x.log');
+  const said = [];
+  const spoke = console.error;
+  console.error = message => said.push(String(message));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(proxy.url + '/v1/messages', {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'm', messages: [] }),
+      });
+      // The turn is what matters. A log that cannot be written must not cost
+      // the request it was turned on to explain.
+      assert.equal(response.status, 200);
+    }
+  } finally {
+    console.error = spoke;
+    delete process.env.MUSE_DEBUG_LOG;
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+  // Two requests, three log attempts each, one sentence. Silence here is the
+  // bug: the launcher announced a path the user would have watched all session.
+  assert.equal(said.length, 1);
+  assert.match(said[0], /cannot write the request log/);
+  assert.match(said[0], /ENOENT/);
 });
 
 test('cache_control keeps only its type, everywhere it can appear', () => {
@@ -2097,8 +2217,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty offline tests in total: fifteen in `adapter.test.cjs` and
-fifteen in `launcher.test.cjs`. All thirty must pass on both platforms;
+There are thirty-two offline tests in total: sixteen in `adapter.test.cjs` and
+sixteen in `launcher.test.cjs`. All thirty-two must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 

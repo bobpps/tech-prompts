@@ -238,11 +238,17 @@ if (!fs.existsSync(readmePath)) {
 
   // The layout block names each suite and how many tests it holds.
   const perSuite = [...readme.matchAll(/([\w.]+\.test\.cjs) +([\w-]+) offline tests/g)];
-  if (!perSuite.length) fail('README.md lists no per-suite offline test counts');
   for (const [, name, word] of perSuite) {
     const got = counts.get(name);
     if (got === undefined) fail(`README.md counts tests in ${name}, which was never run`);
     else if (spelled(word) !== got) fail(`README.md says ${word} tests in ${name}; ${got} ran`);
+  }
+  // Checked against the suites that ran, not against an empty match list. A
+  // layout that lists one suite and drops the other agrees with itself, and a
+  // reader following it installs a test file nothing told them to expect.
+  const documented = new Set(perSuite.map(([, name]) => name));
+  for (const name of counts.keys()) {
+    if (!documented.has(name)) fail(`README.md's layout does not count ${name}`);
   }
 }
 
