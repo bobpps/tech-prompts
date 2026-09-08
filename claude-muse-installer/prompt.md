@@ -675,15 +675,81 @@ const fs = require('node:fs');
 // failure, an idle timeout, or a fault in this file. This log is how the next
 // unsupported field gets identified instead of guessed at.
 //
-// It records the shape of a request and the text of a failure. Never a header,
-// never the credential, never the content of a message. The path is read on
-// each call, so setting it after this file is loaded still works.
+// It records the shape of a request and what a failing reply declared about
+// itself. Never a header, never the credential, never the content of a message
+// - `parseJson` and `errorSummary` below are what hold that line where a body
+// this file did not write passes through. The path is read on each call, so
+// setting it after this file is loaded still works.
 function debugLog(entry) {
   const target = process.env.MUSE_DEBUG_LOG;
   if (!target) return;
   try {
     fs.appendFileSync(target, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
   } catch { /* diagnostics must never break a turn */ }
+}
+
+// `JSON.parse` quotes a window of its input in the error it throws, and every
+// body parsed here is the content of a turn: a request on its way out, a reply
+// on its way back. Left alone, one malformed body puts a fragment of a message
+// into the log through `adapter_error` - the single thing the log promises
+// never to hold. Every parse goes through here instead, so a bad body is
+// reported by name and never by excerpt.
+function parseJson(text, what) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(what + ' is not valid JSON');
+  }
+}
+
+// A provider's refusal is the whole reason this log exists - it is where
+// `stop_sequences` was named - but the body carrying that sentence is written
+// upstream, and nothing constrains what it repeats back. A 4xx that quotes the
+// request it objected to, or echoes the authorization it just rejected, would
+// put exactly what this log promises never to write straight into it.
+//
+// So the body is never copied. Only the fields an error declares about itself
+// are lifted out, capped, and scrubbed of every credential this process holds;
+// a body shaped like anything else is recorded by size alone. That is enough to
+// name an unsupported field, which is what the log is for, and it holds whatever
+// the provider decides to say.
+const ERROR_MESSAGE_LIMIT = 300;
+
+function errorSummary(payload, secrets = []) {
+  const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload == null ? '' : payload);
+  const summary = { bytes: Buffer.isBuffer(payload) ? payload.length : Buffer.byteLength(text, 'utf8') };
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+  // Both shapes are in the wild: `{"error":{...}}` from an Anthropic-compatible
+  // endpoint, and a bare `{"type":...,"message":...}` from a gateway standing in
+  // front of one.
+  const declared = parsed && typeof parsed === 'object' && parsed.error && typeof parsed.error === 'object'
+    ? parsed.error
+    : parsed;
+  const field = name => (declared && typeof declared === 'object' && typeof declared[name] === 'string' ? declared[name] : undefined);
+  const type = field('type') || field('code');
+  const message = field('message');
+  if (type !== undefined) summary.type = redact(type, secrets);
+  if (message !== undefined) {
+    summary.message = redact(message.slice(0, ERROR_MESSAGE_LIMIT), secrets);
+    if (message.length > ERROR_MESSAGE_LIMIT) summary.truncated = true;
+  }
+  // Not silence. "The provider refused and said something this file could not
+  // read" is a different diagnosis from "nothing came back", and the size is
+  // what separates an empty body from a gateway's HTML page.
+  if (type === undefined && message === undefined) summary.unrecognized = true;
+  return summary;
+}
+
+// Struck out rather than trusted not to appear. A credential is the one string
+// here whose exact value is known, so it is the one leak that can be closed by
+// matching instead of by hoping.
+function redact(text, secrets) {
+  let out = text;
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret.length >= 8) out = out.split(secret).join('[redacted]');
+  }
+  return out;
 }
 
 class ToolNames {
@@ -854,7 +920,7 @@ function sseFrame(frame, names) {
   const lines = frame.split(/\r?\n/);
   const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
   if (!data || data === '[DONE]') return frame;
-  const body = names.response(JSON.parse(data));
+  const body = names.response(parseJson(data, 'An upstream event'));
   return [...lines.filter(l => !l.startsWith('data:')), 'data: ' + JSON.stringify(body)].join('\n');
 }
 
@@ -926,7 +992,7 @@ async function startProxy(upstream, token, idleSeconds) {
       target.search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
       let payload;
       if (raw) {
-        const parsed = JSON.parse(raw);
+        const parsed = parseJson(raw, 'The request body');
         debugLog({
           event: 'request', method: req.method, path: req.url.split('?')[0],
           model: parsed.model, stream: parsed.stream === true, bytes: raw.length,
@@ -964,11 +1030,11 @@ async function startProxy(upstream, token, idleSeconds) {
         res.end();
       } else if (response.headers.get('content-type')?.includes('json')) {
         const text = (await collect(response.body, active)).toString('utf8');
-        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, body: text.slice(0, 2000) });
-        res.end(JSON.stringify(names.response(JSON.parse(text))));
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(text, [token, localToken]) });
+        res.end(JSON.stringify(names.response(parseJson(text, 'The upstream reply'))));
       } else {
         const buffered = await collect(response.body, active);
-        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, body: buffered.toString('utf8').slice(0, 2000) });
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(buffered, [token, localToken]) });
         res.end(buffered);
       }
     } catch (error) {
@@ -992,7 +1058,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest };
+module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -1292,7 +1358,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest } = require('./adapter.cjs');
+const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -1404,8 +1470,25 @@ test('stop_sequences never reaches the provider', async () => {
 test('the debug log names an upstream failure and never the credential', async () => {
   const upstream = http.createServer(async (req, res) => {
     for await (const chunk of req) void chunk;
+    // Not JSON, and not from the provider at all: a gateway standing in front of
+    // it, quoting the whole request back. This is the second of the two branches
+    // that log a failure, and it is reached by content type, so it needs a reply
+    // of its own to be exercised.
+    if (req.url === '/v1/gateway') {
+      res.writeHead(502, { 'content-type': 'text/html' });
+      res.end('<html>refused Bearer upstream-test-key carrying the-content-of-a-turn</html>');
+      return;
+    }
     res.writeHead(400, { 'content-type': 'application/json' });
-    res.end('{"error":{"message":"`stop_sequences` is not supported"}}');
+    // Written the way a provider that quotes what it refused writes one: the
+    // sentence worth keeping, and beside it the request and the authorization
+    // it just rejected. Nothing stops an upstream from replying like this, so
+    // the log has to survive it.
+    res.end(JSON.stringify({
+      error: { message: '`stop_sequences` is not supported' },
+      request: { messages: [{ content: 'the-content-of-a-turn' }] },
+      authorization: 'Bearer upstream-test-key',
+    }));
   });
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const file = path.join(os.tmpdir(), 'muse-debug-' + process.pid + '.log');
@@ -1418,17 +1501,79 @@ test('the debug log names an upstream failure and never the credential', async (
       headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'm', messages: [] }),
     });
+    await fetch(proxy.url + '/v1/gateway', {
+      headers: { authorization: 'Bearer ' + proxy.token },
+    });
     const log = fs.readFileSync(file, 'utf8');
     assert.match(log, /"event":"request"/);
     assert.match(log, /"event":"upstream_error"/);
+    // The field that was refused is still there to read, which is what the log
+    // is for.
     assert.match(log, /stop_sequences/);
+    // Both failures were recorded, and neither carried the body that named
+    // them. Asserted on the file as a whole: a leak through either branch is
+    // the same leak.
+    assert.equal(log.match(/"event":"upstream_error"/g).length, 2);
+    assert.match(log, /"status":502[^\n]*"unrecognized":true/);
     assert.equal(log.includes('upstream-test-key'), false);
+    assert.equal(log.includes('the-content-of-a-turn'), false);
   } finally {
     delete process.env.MUSE_DEBUG_LOG;
     fs.rmSync(file, { force: true });
     proxy.server.closeAllConnections(); proxy.server.close();
     upstream.closeAllConnections(); upstream.close();
   }
+});
+
+test('an upstream error reaches the log by what it declares, never by its body', () => {
+  const summary = errorSummary(JSON.stringify({
+    error: { type: 'invalid_request_error', message: '`stop_sequences` is not supported' },
+    request: { messages: [{ content: 'the content of a turn' }] },
+  }));
+  assert.equal(summary.type, 'invalid_request_error');
+  assert.equal(summary.message, '`stop_sequences` is not supported');
+  // The sentence that names the field is kept; everything standing next to it
+  // in the same body is not. Asserted over the whole entry, because a field
+  // added later would carry the leak back in without failing a narrower check.
+  assert.equal(JSON.stringify(summary).includes('the content of a turn'), false);
+
+  // A gateway in front of the provider states the same two fields at the top
+  // level of the body rather than under `error`.
+  const gateway = '{"type":"rate_limit_error","message":"slow down"}';
+  assert.deepEqual(
+    errorSummary(gateway),
+    { bytes: gateway.length, type: 'rate_limit_error', message: 'slow down' }
+  );
+
+  // A credential echoed back is struck out by value, which works wherever in
+  // the sentence the provider chose to put it.
+  const echoed = errorSummary('{"message":"Bearer upstream-key-value was rejected"}', ['upstream-key-value']);
+  assert.equal(echoed.message, 'Bearer [redacted] was rejected');
+});
+
+test('a long message is capped and an unfamiliar body is measured, not quoted', () => {
+  const long = errorSummary(JSON.stringify({ error: { message: 'x'.repeat(400) + 'the tail of a turn' } }));
+  assert.equal(long.message.length, 300);
+  assert.equal(long.truncated, true);
+  assert.equal(long.message.includes('the tail of a turn'), false);
+
+  // A gateway's HTML page declares nothing this can read. It is still worth an
+  // entry - "refused, and said something unreadable" is not "nothing came
+  // back" - but it is recorded by size, not by content.
+  const page = '<html><body>token=abc, prompt was: the content of a turn</body></html>';
+  const unfamiliar = errorSummary(page);
+  assert.deepEqual(unfamiliar, { bytes: page.length, unrecognized: true });
+});
+
+test('a malformed body is reported by name, never by an excerpt of itself', () => {
+  assert.deepEqual(parseJson('{"a":1}', 'The request body'), { a: 1 });
+  // `JSON.parse` puts a window of its input into the SyntaxError it throws, and
+  // for these bodies that window is the content of a turn. The message this
+  // raises instead is fixed, so nothing of the body can travel in it.
+  assert.throws(
+    () => parseJson('{"messages":[{"content":"the content of a turn"}], "model": bad}', 'The request body'),
+    error => error.message === 'The request body is not valid JSON'
+  );
 });
 
 test('cache_control keeps only its type, everywhere it can appear', () => {
@@ -1678,8 +1823,18 @@ arguments; everything else passes through untouched.
 
 Each line of the log is one JSON object: the shape of a request (model, whether
 it streams, how many tools, the longest tool name), the status of the reply, the
-text of any upstream error, and any request the proxy turned away before
-forwarding it. Headers, the key and the content of messages are never written.
+`type` and `message` a failing reply declares about itself, and any request the
+proxy turned away before forwarding it. Headers, the key and the content of
+messages are never written.
+
+An error body is never copied, which is what keeps that last sentence true. A
+provider is free to quote the request it objected to, or the authorization it
+just rejected, and a body copied whole would carry both into the log. Only those
+two declared fields are lifted out, capped at 300 characters, and scrubbed of
+every credential the process holds; a body shaped like anything else — a
+gateway's HTML page, say — is recorded by size alone. That is still enough to
+name an unsupported field, which is what the log is for.
+
 With neither the flag nor the variable, nothing is logged and no file is opened.
 
 Three of the four provider incompatibilities in this document were found this
@@ -1942,8 +2097,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twenty-seven offline tests in total: twelve in `adapter.test.cjs` and
-fifteen in `launcher.test.cjs`. All twenty-seven must pass on both platforms;
+There are thirty offline tests in total: fifteen in `adapter.test.cjs` and
+fifteen in `launcher.test.cjs`. All thirty must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 

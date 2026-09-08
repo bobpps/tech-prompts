@@ -76,8 +76,13 @@ environment for a scripted session. The flag is namespaced because Claude Code h
 its own; the launcher removes only its own flag and passes everything else through.
 
 One JSON object per line: the shape of a request (model, whether it streams, how many tools, the
-longest tool name), the status of the reply, and the text of any error. Headers, the key and the
-content of messages are never written. Without the flag nothing is logged and no file is opened.
+longest tool name), the status of the reply, and the `type` and `message` a failing reply declares.
+Headers, the key and the content of messages are never written.
+
+An error body is never copied whole, because a provider may quote the request it refused or the
+authorization it rejected. Only those two declared fields are logged — capped, and scrubbed of any
+credential — and a body of any other shape is recorded by size alone. Without the flag nothing is
+logged and no file is opened.
 
 [coding-agents]: https://dev.meta.ai/docs/guides/coding-agents
 
