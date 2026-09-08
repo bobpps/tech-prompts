@@ -843,7 +843,13 @@ function errorSummary(payload, secrets = []) {
 function redact(text, secrets) {
   let out = text;
   for (const secret of secrets) {
-    if (typeof secret === 'string' && secret.length >= 8) out = out.split(secret).join('[redacted]');
+    // Empty only. Splitting on '' explodes the text into single characters,
+    // which is the one input this cannot take - and it is not a length below
+    // which a credential stops being one. Nothing here validates how long a
+    // configured token is, so a guarantee that depended on that would hold for
+    // some keys and not others. A short token redacted noisily costs
+    // legibility in a diagnostic; the other way costs a key.
+    if (typeof secret === 'string' && secret !== '') out = out.split(secret).join('[redacted]');
   }
   return out;
 }
@@ -1739,6 +1745,14 @@ test('an upstream error reaches the log by what it declares, never by its body',
   // the sentence the provider chose to put it.
   const echoed = errorSummary('{"message":"Bearer upstream-key-value was rejected"}', ['upstream-key-value']);
   assert.equal(echoed.message, 'Bearer [redacted] was rejected');
+
+  // A credential is a credential at any length: nothing validates how long a
+  // configured token is, so a guarantee that held only above some length would
+  // hold for some keys and not others.
+  assert.equal(errorSummary('{"message":"key abc rejected"}', ['abc']).message, 'key [redacted] rejected');
+  // The empty string is the one value that cannot be searched for - splitting on
+  // it would return the text one character at a time. It leaves the text alone.
+  assert.equal(errorSummary('{"message":"hello"}', ['']).message, 'hello');
 });
 
 test('a long message is redacted before it is capped, and an unfamiliar body is measured', () => {
