@@ -792,10 +792,18 @@ function errorSummary(payload, secrets = []) {
   const field = name => (declared && typeof declared === 'object' && typeof declared[name] === 'string' ? declared[name] : undefined);
   const type = field('type') || field('code');
   const message = field('message');
-  if (type !== undefined) summary.type = redact(type, secrets);
+  // Redacted first, capped second, and never the other way round. A credential
+  // lying across the cap loses its tail to the cut, so the exact-match search
+  // that removes it finds nothing and its head survives into the log - the cap
+  // would be what defeated the redaction. Both fields are capped: each is a
+  // string the provider chooses, and neither belongs in a log without a bound.
+  if (type !== undefined) summary.type = redact(type, secrets).slice(0, ERROR_MESSAGE_LIMIT);
   if (message !== undefined) {
-    summary.message = redact(message.slice(0, ERROR_MESSAGE_LIMIT), secrets);
-    if (message.length > ERROR_MESSAGE_LIMIT) summary.truncated = true;
+    const scrubbed = redact(message, secrets);
+    summary.message = scrubbed.slice(0, ERROR_MESSAGE_LIMIT);
+    // Measured on what is written, not on what arrived: redaction shortens the
+    // text, and `truncated` is a statement about the sentence being read.
+    if (scrubbed.length > ERROR_MESSAGE_LIMIT) summary.truncated = true;
   }
   // Not silence. "The provider refused and said something this file could not
   // read" is a different diagnosis from "nothing came back", and the size is
@@ -1633,11 +1641,37 @@ test('an upstream error reaches the log by what it declares, never by its body',
   assert.equal(echoed.message, 'Bearer [redacted] was rejected');
 });
 
-test('a long message is capped and an unfamiliar body is measured, not quoted', () => {
+test('a long message is redacted before it is capped, and an unfamiliar body is measured', () => {
   const long = errorSummary(JSON.stringify({ error: { message: 'x'.repeat(400) + 'the tail of a turn' } }));
   assert.equal(long.message.length, 300);
   assert.equal(long.truncated, true);
   assert.equal(long.message.includes('the tail of a turn'), false);
+
+  // The credential lies across the 300-character cap. Cut first, its tail goes
+  // with the cut, the exact-match search finds nothing, and the head of the
+  // token stays in the log - the cap defeating the redaction.
+  const secret = 'sk-' + 'a'.repeat(40);
+  const straddling = errorSummary(
+    JSON.stringify({ error: { message: 'x'.repeat(290) + secret + ' was rejected' } }),
+    [secret]
+  );
+  assert.equal(straddling.message.includes('sk-'), false);
+  assert.equal(straddling.message, 'x'.repeat(290) + '[redacted]');
+  assert.equal(straddling.truncated, true);
+
+  // Redaction shortens the text, so a message over the cap before scrubbing can
+  // fit under it after - and then nothing was cut. `truncated` describes the
+  // sentence in the log, not the one that arrived.
+  const shortened = errorSummary(
+    JSON.stringify({ error: { message: 'x'.repeat(267) + secret } }),
+    [secret]
+  );
+  assert.equal(shortened.message, 'x'.repeat(267) + '[redacted]');
+  assert.equal('truncated' in shortened, false);
+
+  // A type is a string the provider chooses too, so it is bounded as well.
+  const shouting = errorSummary(JSON.stringify({ error: { type: 'e'.repeat(400) } }));
+  assert.equal(shouting.type.length, 300);
 
   // A gateway's HTML page declares nothing this can read. It is still worth an
   // entry - "refused, and said something unreadable" is not "nothing came
