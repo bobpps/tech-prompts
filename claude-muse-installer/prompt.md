@@ -248,6 +248,10 @@ unchanged and reconcile only the other settings.
 ```bash
 # Add the Meta Model API key between single quotes. Never share this file.
 MUSE_AUTH_TOKEN=''
+
+# The host on its own. A key never belongs in this URL - the HTTP client refuses
+# a URL that carries credentials, so `https://user:key@host` fails every request
+# rather than some of them. The launcher refuses it at startup and says so.
 MUSE_BASE_URL='https://api.meta.ai'
 MUSE_MODEL='muse-spark-1.3-contributor'
 
@@ -378,6 +382,35 @@ function parseEnvFile(text) {
   return config;
 }
 
+// Checked at load, not at the first request. `fetch` refuses a URL that carries
+// credentials outright - it throws before a packet moves - so a base URL written
+// as `https://user:password@host` fails every request this launcher will ever
+// make, and each one arrives as a 502 from a proxy that looks broken. It is a
+// configuration mistake, and this is where configuration mistakes are named.
+//
+// None of these messages quote the value. A URL that is malformed can still
+// carry a password, and a sentence printed to the terminal is a sentence that
+// gets pasted into a bug report. The setting and the file locate it precisely
+// enough for someone who wrote it.
+function checkBaseUrl(value, file) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('MUSE_BASE_URL in ' + file + ' is not a URL.');
+  }
+  if (url.username || url.password) {
+    throw new Error(
+      'MUSE_BASE_URL in ' + file + ' carries credentials in the URL, which the HTTP\n' +
+      '  client refuses - every request would fail. Write the host on its own and put\n' +
+      '  the key in MUSE_AUTH_TOKEN, which is the header this adapter sets.'
+    );
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error('MUSE_BASE_URL in ' + file + ' must be an http or https URL.');
+  }
+}
+
 function loadConfig(file = ENV_FILE, read = fs.readFileSync) {
   let text;
   try {
@@ -391,6 +424,9 @@ function loadConfig(file = ENV_FILE, read = fs.readFileSync) {
     throw new Error('set MUSE_AUTH_TOKEN in ' + file + ' before launching.');
   }
   if (!config.MUSE_BASE_URL) throw new Error('MUSE_BASE_URL is not set in ' + file);
+  // After the token check, which owns the placeholder case: a fresh install has
+  // both unset, and "set your key" is the sentence that moves that user forward.
+  checkBaseUrl(config.MUSE_BASE_URL, file);
   return config;
 }
 
@@ -710,7 +746,7 @@ async function main() {
 }
 
 module.exports = {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
+  parseEnvFile, loadConfig, checkBaseUrl, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan,
   hasControllingTerminal, exitStatus, SCRUB, DEFAULTS,
 };
@@ -1244,7 +1280,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
+  parseEnvFile, loadConfig, checkBaseUrl, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, hasControllingTerminal, exitStatus,
 } = require('./launcher.cjs');
 
@@ -1549,6 +1585,39 @@ test('the debug flag is stripped from the arguments and names a log file', () =>
   assert.deepEqual(chosen.args, ['-p', 'hi']);
   assert.equal(chosen.log, '/logs/chosen.log');
   assert.equal(chosen.chosen, true);
+});
+
+test('a base URL carrying credentials is refused at load, not at the first request', () => {
+  const read = text => () => text;
+  const config = key => "MUSE_AUTH_TOKEN='" + KEY + "'\nMUSE_BASE_URL='" + key + "'\n";
+
+  // The shape the HTTP client refuses outright. Caught here, it costs one
+  // sentence; caught at the first request it costs every request, as a 502 from
+  // a proxy that looks broken.
+  assert.throws(
+    () => loadConfig('provider.env', read(config('https://user:pw@api.meta.ai'))),
+    /carries credentials in the URL/
+  );
+  // A username with no password is the same mistake half written.
+  assert.throws(() => checkBaseUrl('https://user@api.meta.ai', 'provider.env'), /carries credentials/);
+  // `new URL` takes any scheme, so a typo in the scheme still parses and still
+  // carries the credentials. Refused for that, before the protocol is reached.
+  assert.throws(() => checkBaseUrl('htp://user:pw@api.meta.ai', 'provider.env'), /carries credentials/);
+
+  // No message quotes the value: a URL malformed enough not to parse can still
+  // carry a password, and this sentence is one a user pastes into a bug report.
+  try {
+    checkBaseUrl('https://user:s3cret@api meta.ai', 'provider.env');
+    assert.fail('expected a refusal');
+  } catch (error) {
+    assert.match(error.message, /is not a URL/);
+    assert.equal(error.message.includes('s3cret'), false);
+  }
+
+  assert.throws(() => checkBaseUrl('file:///etc/passwd', 'provider.env'), /http or https/);
+  // The ordinary cases stay ordinary, including a plain-http local gateway.
+  assert.equal(checkBaseUrl('https://api.meta.ai/v1', 'provider.env'), undefined);
+  assert.equal(checkBaseUrl('http://127.0.0.1:8080', 'provider.env'), undefined);
 });
 
 test('a bare debug flag never consumes the argument after it', () => {
@@ -2503,8 +2572,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-six offline tests in total: twenty in `adapter.test.cjs` and
-sixteen in `launcher.test.cjs`. All thirty-six must pass on both platforms;
+There are thirty-seven offline tests in total: twenty in `adapter.test.cjs` and
+seventeen in `launcher.test.cjs`. All thirty-seven must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -2560,6 +2629,10 @@ explicitly:
 - Claude Code reporting the model as temporarily unavailable while read-only
   tools keep working: that is auto mode's classifier failing, not an outage.
   Check the log before believing the message.
+- `claude-muse` refusing to start over `MUSE_BASE_URL`: the URL is malformed, is
+  not http or https, or carries credentials. Fix `provider.env` and run again;
+  the message names the setting and the file, and quotes neither the value nor
+  anything in it.
 
 Then run a cheap Claude Code smoke test with no customizations or tools.
 
