@@ -840,6 +840,18 @@ function errorSummary(payload, secrets = []) {
 // Struck out rather than trusted not to appear. A credential is the one string
 // here whose exact value is known, so it is the one leak that can be closed by
 // matching instead of by hoping.
+// The one thing this log has ever needed from a header is which of the two
+// response branches a reply took, and that is the media type by itself. The
+// value it comes from is written upstream: the parameters after a semicolon,
+// and anything a gateway decides to put there instead, are text this file has
+// no claim over - and the log says it holds no header at all. So the value is
+// reduced to its media type, and kept only if that is what it turns out to be.
+function mediaType(value) {
+  if (typeof value !== 'string') return null;
+  const type = value.split(';')[0].trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9.+_-]*\/[a-z0-9][a-z0-9.+_-]*$/.test(type) ? type : null;
+}
+
 function redact(text, secrets) {
   let out = text;
   for (const secret of secrets) {
@@ -1141,7 +1153,7 @@ async function startProxy(upstream, token, idleSeconds) {
         body: payload,
       });
       active();
-      debugLog({ event: 'response', status: response.status, type: response.headers.get('content-type') });
+      debugLog({ event: 'response', status: response.status, type: mediaType(response.headers.get('content-type')) });
       res.statusCode = response.status;
       for (const [key, value] of response.headers) {
         if (!['content-length', 'content-encoding', 'transfer-encoding', 'connection'].includes(key)) res.setHeader(key, value);
@@ -1207,7 +1219,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -1546,7 +1558,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -1667,7 +1679,10 @@ test('the debug log names an upstream failure and never the credential', async (
       res.end('<html>refused Bearer upstream-test-key carrying the-content-of-a-turn</html>');
       return;
     }
-    res.writeHead(400, { 'content-type': 'application/json' });
+    // The parameters are the provider's to write, and this one puts the
+    // credential it rejected in them. The header never reaches the log, so the
+    // assertion below that the key is absent covers this branch too.
+    res.writeHead(400, { 'content-type': 'application/json; charset=utf-8; note=upstream-test-key' });
     // Written the way a provider that quotes what it refused writes one: the
     // sentence worth keeping, and beside it the request and the authorization
     // it just rejected. Nothing stops an upstream from replying like this, so
@@ -1879,6 +1894,21 @@ test('an error inside a streaming reply is logged, not read as a success', async
     proxy.server.closeAllConnections(); proxy.server.close();
     upstream.closeAllConnections(); upstream.close();
   }
+});
+
+test('the logged content type is a media type and nothing else', () => {
+  assert.equal(mediaType('application/json'), 'application/json');
+  assert.equal(mediaType('text/event-stream; charset=utf-8'), 'text/event-stream');
+  assert.equal(mediaType('APPLICATION/JSON'), 'application/json');
+  assert.equal(mediaType('application/vnd.api+json'), 'application/vnd.api+json');
+  // A header is written upstream, and the parameters are where anything can be
+  // put. They are dropped rather than trusted.
+  assert.equal(mediaType('application/json; key=LLM|123|secret'), 'application/json');
+  // A value that is not a media type is not quoted in its place. `null` still
+  // separates "the reply declared something unreadable" from "no reply".
+  assert.equal(mediaType('Bearer LLM|123|secret'), null);
+  assert.equal(mediaType('application/json LLM|123|secret'), null);
+  assert.equal(mediaType(null), null);
 });
 
 test('an ordinary streaming frame is not mistaken for a failure', () => {
@@ -2427,8 +2457,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-four offline tests in total: eighteen in `adapter.test.cjs` and
-sixteen in `launcher.test.cjs`. All thirty-four must pass on both platforms;
+There are thirty-five offline tests in total: nineteen in `adapter.test.cjs` and
+sixteen in `launcher.test.cjs`. All thirty-five must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
