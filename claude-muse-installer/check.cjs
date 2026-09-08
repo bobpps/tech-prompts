@@ -217,6 +217,35 @@ if (!claim) {
   if (total !== ran) fail(`the prompt says ${total} offline tests in total; ${ran} ran`);
 }
 
+// ---------------------------------------------------------------- readme
+
+// The README states the same counts for a reader who never opens the prompt,
+// and until now nothing compared the two. They drifted the first time the
+// suites grew: the prompt said thirty and the README still said twenty-seven,
+// so the two documents told a user to expect different numbers from the same
+// install. Read from beside the prompt, and skipped when there is none, so the
+// checker still runs against an extracted copy.
+const readmePath = path.join(path.dirname(promptPath), 'README.md');
+if (!fs.existsSync(readmePath)) {
+  note('no README.md beside the prompt; its counts were not checked');
+} else {
+  const readme = fs.readFileSync(readmePath, 'utf8').replace(/\s+/g, ' ');
+  const ran = [...counts.values()].reduce((sum, n) => sum + n, 0);
+
+  const total = readme.match(/runs ([\w-]+) offline tests/);
+  if (!total) fail('README.md states no total offline test count');
+  else if (spelled(total[1]) !== ran) fail(`README.md says ${total[1]} offline tests in total; ${ran} ran`);
+
+  // The layout block names each suite and how many tests it holds.
+  const perSuite = [...readme.matchAll(/([\w.]+\.test\.cjs) +([\w-]+) offline tests/g)];
+  if (!perSuite.length) fail('README.md lists no per-suite offline test counts');
+  for (const [, name, word] of perSuite) {
+    const got = counts.get(name);
+    if (got === undefined) fail(`README.md counts tests in ${name}, which was never run`);
+    else if (spelled(word) !== got) fail(`README.md says ${word} tests in ${name}; ${got} ran`);
+  }
+}
+
 // ---------------------------------------------------------------- report
 
 for (const line of notes) console.log('  ' + line);
