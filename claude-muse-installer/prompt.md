@@ -311,6 +311,7 @@ file is identical on every platform; it decides what to do from
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { randomBytes } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { startProxy } = require('./adapter.cjs');
 
@@ -431,6 +432,69 @@ function buildChildEnv(source, config, windows = WINDOWS) {
     // sessions, so pin the provider default; this beats every other source.
     FORCE_PROMPT_CACHING_5M: '1',
   });
+}
+
+// `--muse-debug` turns the adapter's request log on for one run, and
+// `--muse-debug=<path>` says where to write it. The value is joined to the flag
+// rather than taken as the argument after it, because
+// `claude-muse --muse-debug "write a test"` would otherwise swallow the prompt
+// as a filename.
+//
+// The flag is namespaced instead of a plain `--debug`: Claude Code has one of
+// its own, and taking that name here would remove a flag from the program this
+// launcher exists to run. Only this flag is removed; everything else passes
+// through in the order it was given.
+//
+// The generated name carries random bytes as well as the time. The default
+// lands in a directory every account on the machine can write to, and a name
+// that is only a timestamp is a name another account can predict and leave a
+// symlink under - which is how a diagnostic log ends up appended to somebody
+// else's file. Timestamp for a human reading `ls`, randomness for everything
+// else.
+function debugTarget(args, dir = os.tmpdir(), now = Date.now(), nonce = randomBytes(6).toString('hex')) {
+  const at = args.findIndex(arg => arg === '--muse-debug' || arg.startsWith('--muse-debug='));
+  if (at === -1) return { args, log: null, chosen: false };
+  const chosen = args[at].slice('--muse-debug='.length);
+  return {
+    args: [...args.slice(0, at), ...args.slice(at + 1)],
+    log: chosen || path.join(dir, 'claude-muse-' + now + '-' + nonce + '.log'),
+    chosen: Boolean(chosen),
+  };
+}
+
+// A log the user asked for and did not get is worse than never having offered
+// the flag: the path is announced, the failure is reproduced, and the file that
+// was meant to explain it is empty or missing. `--muse-debug=<path>` can name a
+// destination this process cannot write - a directory that does not exist, one
+// it has no rights to - and every append in the adapter is deliberately silent,
+// because a diagnostic must never break the turn it exists to explain.
+//
+// So the destination is opened once here instead, and a path that cannot be
+// written stops the run. The run about to start is the one the user wanted
+// recorded; starting it blind wastes the reproduction, which is the expensive
+// part.
+//
+// Created private, and created exclusively when this program invented the name.
+// The log holds the shape of every request and the text of every refusal, and
+// the default sits in a directory shared with every other account on the
+// machine, where `022` would otherwise publish it as `0644`. `0600` applies
+// only to a file this call creates; a path the user already owns keeps the
+// rights they gave it.
+//
+// `ax` for a generated name, so one already waiting under it - a symlink into
+// another file - is refused instead of appended to. `a` for a path the user
+// named, because appending to a log they already have is the point of naming
+// one.
+function openDebugLog(target, chosen = false, open = fs.openSync, close = fs.closeSync) {
+  try {
+    close(open(target, chosen ? 'a' : 'ax', 0o600));
+  } catch (error) {
+    throw new Error(
+      'cannot write the debug log to ' + target + ': ' + ((error && error.code) || (error && error.message)) + '\n' +
+      '  --muse-debug=<path> needs a path in a directory that exists and is writable,\n' +
+      '  and a generated log name must not already exist.'
+    );
+  }
 }
 
 function claudeArgs(args, defaultEffort) {
@@ -585,6 +649,13 @@ function signalPlan(platform = process.platform, terminal = hasControllingTermin
 }
 
 async function main() {
+  // Read here, acted on twice. The destination has to be opened before the
+  // proxy is listening: `main`'s catch only sets an exit code, so a throw past
+  // that point would leave the process alive on an open server. Publishing the
+  // path to the environment has to wait until after the child environment is
+  // built, further down, or Claude Code inherits it.
+  const debug = debugTarget(process.argv.slice(2));
+  if (debug.log) openDebugLog(debug.log, debug.chosen);
   const config = loadConfig();
   const target = resolveClaude();
   if (!target) {
@@ -596,29 +667,50 @@ async function main() {
     );
   }
   const proxy = await startProxy(config.MUSE_BASE_URL, config.MUSE_AUTH_TOKEN, config.MUSE_IDLE_TIMEOUT_SECONDS);
-  const env = buildChildEnv(process.env, config);
-  env.ANTHROPIC_BASE_URL = proxy.url;
-  env.ANTHROPIC_AUTH_TOKEN = proxy.token;
-  const args = [...target.prefix, ...claudeArgs(process.argv.slice(2), config.MUSE_EFFORT)];
-  const child = spawn(target.file, args, { env, ...spawnOptions() });
+  // Everything past this point runs with a socket already listening, and this
+  // function's only caller turns a rejection into an exit code. A throw that
+  // left the server open would hold the event loop and hang the terminal
+  // instead of reporting the fault - which is why the debug destination is
+  // opened at the top of this function, where there is nothing yet to close.
+  // Closing here for anything that throws anyway makes that ordering a
+  // preference rather than the only thing standing between a mistyped path and
+  // a process that never exits.
+  try {
+    const env = buildChildEnv(process.env, config);
+    env.ANTHROPIC_BASE_URL = proxy.url;
+    env.ANTHROPIC_AUTH_TOKEN = proxy.token;
+    // Published after the child environment is built, so the log stays a property
+    // of this process and Claude Code does not inherit it. The path was already
+    // opened, so this announces a file that exists.
+    if (debug.log) {
+      process.env.MUSE_DEBUG_LOG = debug.log;
+      console.error('claude-muse: request log -> ' + debug.log);
+    }
+    const args = [...target.prefix, ...claudeArgs(debug.args, config.MUSE_EFFORT)];
+    const child = spawn(target.file, args, { env, ...spawnOptions() });
 
-  let finished = false;
-  const finish = code => {
-    if (finished) return;
-    finished = true;
+    let finished = false;
+    const finish = code => {
+      if (finished) return;
+      finished = true;
+      proxy.server.closeAllConnections();
+      proxy.server.close();
+      process.exitCode = code;
+    };
+    child.on('error', () => { console.error('Unable to start Claude Code.'); finish(1); });
+    child.on('exit', (code, signal) => finish(exitStatus(code, signal)));
+    const plan = signalPlan();
+    for (const signal of plan.absorb) process.on(signal, () => {});
+    for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
+  } catch (error) {
     proxy.server.closeAllConnections();
     proxy.server.close();
-    process.exitCode = code;
-  };
-  child.on('error', () => { console.error('Unable to start Claude Code.'); finish(1); });
-  child.on('exit', (code, signal) => finish(exitStatus(code, signal)));
-  const plan = signalPlan();
-  for (const signal of plan.absorb) process.on(signal, () => {});
-  for (const signal of plan.forward) process.on(signal, () => child.kill(signal));
+    throw error;
+  }
 }
 
 module.exports = {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
+  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan,
   hasControllingTerminal, exitStatus, SCRUB, DEFAULTS,
 };
@@ -637,6 +729,142 @@ Create `~/.local/lib/claude-muse/adapter.cjs` with this exact content:
 const http = require('node:http');
 const { createHash, randomBytes } = require('node:crypto');
 const { once } = require('node:events');
+const fs = require('node:fs');
+
+// Diagnostics, off unless MUSE_DEBUG_LOG names a file.
+//
+// Meta rejects request fields this adapter has not learned about yet, one at a
+// time, and Claude Code reports every one of them the same way: "the model is
+// temporarily unavailable" - a sentence that names neither the request nor the
+// field. Without a record there is nothing to tell that apart from a network
+// failure, an idle timeout, or a fault in this file. This log is how the next
+// unsupported field gets identified instead of guessed at.
+//
+// It records the shape of a request and what a failing reply declared about
+// itself. Never a header, never the credential, never the content of a message
+// - `parseJson` and `errorSummary` below are what hold that line where a body
+// this file did not write passes through. The path is read on each call, so
+// setting it after this file is loaded still works.
+let reportedFault = null;
+
+function debugLog(entry) {
+  const target = process.env.MUSE_DEBUG_LOG;
+  if (!target) return;
+  try {
+    // The launcher opens its own target `0600`, but `MUSE_DEBUG_LOG` set in the
+    // environment never passes through it. Applied only when this call creates
+    // the file.
+    fs.appendFileSync(target, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n', { mode: 0o600 });
+  } catch (error) {
+    // Never thrown: a diagnostic that breaks the turn it was meant to explain
+    // is worse than no diagnostic at all. Never silent either - a user told the
+    // log is being written, who then finds nothing in it, has been sent to look
+    // in the wrong place for the rest of the session.
+    //
+    // Said once per destination, not once per request: this runs three times a
+    // turn, and a full disk would otherwise bury the failure it is reporting.
+    // Writing is still attempted afterwards, because the entry worth having is
+    // usually the one that has not happened yet, and the condition may lift.
+    if (reportedFault !== target) {
+      reportedFault = target;
+      console.error(
+        'claude-muse: cannot write the request log to ' + target + ': ' +
+        ((error && error.code) || (error && error.message)) +
+        ' (further failures on this path are not reported)'
+      );
+    }
+  }
+}
+
+// `JSON.parse` quotes a window of its input in the error it throws, and every
+// body parsed here is the content of a turn: a request on its way out, a reply
+// on its way back. Left alone, one malformed body puts a fragment of a message
+// into the log through `adapter_error` - the single thing the log promises
+// never to hold. Every parse goes through here instead, so a bad body is
+// reported by name and never by excerpt.
+function parseJson(text, what) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(what + ' is not valid JSON');
+  }
+}
+
+// A provider's refusal is the whole reason this log exists - it is where
+// `stop_sequences` was named - but the body carrying that sentence is written
+// upstream, and nothing constrains what it repeats back. A 4xx that quotes the
+// request it objected to, or echoes the authorization it just rejected, would
+// put exactly what this log promises never to write straight into it.
+//
+// So the body is never copied. Only the fields an error declares about itself
+// are lifted out, capped, and scrubbed of every credential this process holds;
+// a body shaped like anything else is recorded by size alone. That is enough to
+// name an unsupported field, which is what the log is for, and it holds whatever
+// the provider decides to say.
+const ERROR_MESSAGE_LIMIT = 300;
+
+function errorSummary(payload, secrets = []) {
+  const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload == null ? '' : payload);
+  const summary = { bytes: Buffer.isBuffer(payload) ? payload.length : Buffer.byteLength(text, 'utf8') };
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+  // Both shapes are in the wild: `{"error":{...}}` from an Anthropic-compatible
+  // endpoint, and a bare `{"type":...,"message":...}` from a gateway standing in
+  // front of one.
+  const declared = parsed && typeof parsed === 'object' && parsed.error && typeof parsed.error === 'object'
+    ? parsed.error
+    : parsed;
+  const field = name => (declared && typeof declared === 'object' && typeof declared[name] === 'string' ? declared[name] : undefined);
+  const type = field('type') || field('code');
+  const message = field('message');
+  // Redacted first, capped second, and never the other way round. A credential
+  // lying across the cap loses its tail to the cut, so the exact-match search
+  // that removes it finds nothing and its head survives into the log - the cap
+  // would be what defeated the redaction. Both fields are capped: each is a
+  // string the provider chooses, and neither belongs in a log without a bound.
+  if (type !== undefined) summary.type = redact(type, secrets).slice(0, ERROR_MESSAGE_LIMIT);
+  if (message !== undefined) {
+    const scrubbed = redact(message, secrets);
+    summary.message = scrubbed.slice(0, ERROR_MESSAGE_LIMIT);
+    // Measured on what is written, not on what arrived: redaction shortens the
+    // text, and `truncated` is a statement about the sentence being read.
+    if (scrubbed.length > ERROR_MESSAGE_LIMIT) summary.truncated = true;
+  }
+  // Not silence. "The provider refused and said something this file could not
+  // read" is a different diagnosis from "nothing came back", and the size is
+  // what separates an empty body from a gateway's HTML page.
+  if (type === undefined && message === undefined) summary.unrecognized = true;
+  return summary;
+}
+
+// Struck out rather than trusted not to appear. A credential is the one string
+// here whose exact value is known, so it is the one leak that can be closed by
+// matching instead of by hoping.
+// The one thing this log has ever needed from a header is which of the two
+// response branches a reply took, and that is the media type by itself. The
+// value it comes from is written upstream: the parameters after a semicolon,
+// and anything a gateway decides to put there instead, are text this file has
+// no claim over - and the log says it holds no header at all. So the value is
+// reduced to its media type, and kept only if that is what it turns out to be.
+function mediaType(value) {
+  if (typeof value !== 'string') return null;
+  const type = value.split(';')[0].trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9.+_-]*\/[a-z0-9][a-z0-9.+_-]*$/.test(type) ? type : null;
+}
+
+function redact(text, secrets) {
+  let out = text;
+  for (const secret of secrets) {
+    // Empty only. Splitting on '' explodes the text into single characters,
+    // which is the one input this cannot take - and it is not a length below
+    // which a credential stops being one. Nothing here validates how long a
+    // configured token is, so a guarantee that depended on that would hold for
+    // some keys and not others. A short token redacted noisily costs
+    // legibility in a diagnostic; the other way costs a key.
+    if (typeof secret === 'string' && secret !== '') out = out.split(secret).join('[redacted]');
+  }
+  return out;
+}
 
 class ToolNames {
   constructor() { this.originals = new Map(); }
@@ -711,12 +939,20 @@ class ToolNames {
 // whole body would silently reduce an MCP schema property of that name to
 // `{"type": ...}`, dropping its own `properties` and `description` on the way
 // through, and the tool would then be described wrongly to the model.
+// FORCE_PROMPT_CACHING_5M pins the provider default at the source, and with
+// that variable set a direct connection never produced the 400 this guards
+// against, so on a good day nothing here fires. It stays anyway. That variable
+// is undocumented; a Claude Code release can rename or drop it without notice,
+// and the failure mode when it does is every request refused. The reductions
+// are counted into the debug log so the day the variable stops working shows
+// up as a log line rather than only as a broken install.
 function plainCacheControl(body) {
   if (!body || typeof body !== 'object') return body;
+  let reduced = 0;
   const reduce = holder => {
     const value = holder && holder.cache_control;
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      for (const extra of Object.keys(value)) if (extra !== 'type') delete value[extra];
+      for (const extra of Object.keys(value)) if (extra !== 'type') { delete value[extra]; reduced++; }
     }
   };
   const blocks = content => {
@@ -730,6 +966,7 @@ function plainCacheControl(body) {
   blocks(body.system);
   if (Array.isArray(body.tools)) for (const tool of body.tools) reduce(tool);
   if (Array.isArray(body.messages)) for (const message of body.messages) blocks(message && message.content);
+  if (reduced) debugLog({ event: 'cache_control_reduced', fields: reduced });
   return body;
 }
 
@@ -766,6 +1003,24 @@ function webSearchTools(body) {
   return body;
 }
 
+// Meta rejects `stop_sequences` outright with HTTP 400.
+//
+// Claude Code sends it on the auto-mode safety classifier call - the request
+// that decides whether a tool call may run without stopping to ask. That
+// request carries no tools and does not stream, which is why it is the only
+// place the field appears and why ordinary turns in the same session are
+// unaffected. Claude Code renders the resulting 400 as "the model is
+// temporarily unavailable", so the visible symptom is that every gated tool -
+// Bash, Edit, Agent - fails while reading files keeps working.
+//
+// Dropping the field changes where generation stops, not what it contains: the
+// model may run past the point the caller meant to cut. That is a real cost,
+// and the alternative is a feature that never works at all.
+function stopSequences(body) {
+  if (body && typeof body === 'object') delete body.stop_sequences;
+  return body;
+}
+
 // Buffers a non-streaming body chunk by chunk rather than through `.json()` or
 // `.arrayBuffer()`, so the idle timer sees the transfer and a slow but healthy
 // download is not mistaken for a dead connection.
@@ -775,17 +1030,50 @@ async function collect(body, active) {
   return Buffer.concat(chunks);
 }
 
+// A streaming reply commits to its status line before it knows how the turn
+// ends. The provider answers 200, opens the stream, and can still emit
+// `event: error` a second later - upstream overloaded, context too long, the
+// turn refused. Nothing about that reaches the status the log already recorded,
+// so a failed turn read as a successful one, which is the reading that sends a
+// user looking at their own machine.
+//
+// Returns the data of an error event, for `errorSummary` to reduce to the two
+// fields it declares, and null for everything else. Never throws: a frame this
+// cannot parse is `sseFrame`'s to report, and a diagnostic must not be what
+// ends a stream.
+function sseError(frame) {
+  const data = sseData(frame);
+  if (!data || data === '[DONE]') return null;
+  let parsed;
+  try { parsed = JSON.parse(data); } catch { return null; }
+  return parsed && parsed.type === 'error' ? data : null;
+}
+
+function sseData(frame) {
+  return frame.split(/\r?\n/)
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).replace(/^ /, ''))
+    .join('\n');
+}
+
 function sseFrame(frame, names) {
   const lines = frame.split(/\r?\n/);
-  const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
+  const data = sseData(frame);
   if (!data || data === '[DONE]') return frame;
-  const body = names.response(JSON.parse(data));
+  const body = names.response(parseJson(data, 'An upstream event'));
   return [...lines.filter(l => !l.startsWith('data:')), 'data: ' + JSON.stringify(body)].join('\n');
 }
 
 async function startProxy(upstream, token, idleSeconds) {
   const origin = new URL(upstream);
   const localToken = randomBytes(32).toString('hex');
+  // Every string whose exact value is known and must never reach the log,
+  // gathered once so no path out of this file can be given a shorter list than
+  // another. The configured URL carries credentials of its own when a gateway
+  // is written as `https://user:password@host`, and `fetch` refuses such a URL
+  // by throwing an error that quotes the whole of it - on every request, not on
+  // some rare path.
+  const secrets = [token, localToken, origin.password, origin.username].filter(Boolean);
   // Idle, not wall-clock. A high-effort turn over a large context can stream for
   // far longer than any fixed cutoff, and aborting a healthy stream mid-flight
   // would truncate the turn: the headers have already gone out, so there is no
@@ -793,11 +1081,18 @@ async function startProxy(upstream, token, idleSeconds) {
   // which leaves it measuring only genuine silence.
   const idleMs = Number(idleSeconds) > 0 ? Number(idleSeconds) * 1000 : 300000;
   const server = http.createServer(async (req, res) => {
+    // Logged before the checks below, not after. A request this proxy turns
+    // away leaves no other trace, and "no entry at all" is exactly what
+    // distinguishes a client calling somewhere this adapter does not serve
+    // from one whose request reached the provider and was refused there.
+    debugLog({ event: 'incoming', method: req.method, path: req.url.split('?')[0] });
     if (req.headers.authorization !== 'Bearer ' + localToken) {
+      debugLog({ event: 'rejected', reason: 'auth', method: req.method, path: req.url.split('?')[0] });
       res.writeHead(401).end();
       return;
     }
     if (!req.url.startsWith('/v1/') || !['POST', 'GET'].includes(req.method)) {
+      debugLog({ event: 'rejected', reason: 'path', method: req.method, path: req.url.split('?')[0] });
       res.writeHead(404).end();
       return;
     }
@@ -842,11 +1137,30 @@ async function startProxy(upstream, token, idleSeconds) {
       const target = new URL(origin);
       target.pathname = origin.pathname.replace(/\/$/, '') + req.url.split('?')[0];
       target.search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+      let payload;
+      if (raw) {
+        const parsed = parseJson(raw, 'The request body');
+        debugLog({
+          event: 'request', method: req.method, path: req.url.split('?')[0],
+          // What arrived on the socket, already counted by the read loop above.
+          // `raw.length` would be UTF-16 code units of the decoded string: a CJK
+          // character counts one instead of three, so a prompt or a tool schema
+          // in any non-Latin script reports a body far smaller than the one that
+          // was sent - and size is the first thing read when a request is
+          // suspected of being too large.
+          model: parsed.model, stream: parsed.stream === true, bytes: size,
+          tools: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
+          messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
+          longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
+        });
+        payload = JSON.stringify(stopSequences(plainCacheControl(webSearchTools(names.request(parsed)))));
+      }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
-        body: raw ? JSON.stringify(plainCacheControl(webSearchTools(names.request(JSON.parse(raw))))) : undefined,
+        body: payload,
       });
       active();
+      debugLog({ event: 'response', status: response.status, type: mediaType(response.headers.get('content-type')) });
       res.statusCode = response.status;
       for (const [key, value] of response.headers) {
         if (!['content-length', 'content-encoding', 'transfer-encoding', 'connection'].includes(key)) res.setHeader(key, value);
@@ -854,6 +1168,17 @@ async function startProxy(upstream, token, idleSeconds) {
       if (response.headers.get('content-type')?.includes('text/event-stream')) {
         const decoder = new TextDecoder();
         let buffer = '';
+        // Read from the frames on their way through, so the entry sits beside
+        // the `response` line that recorded the 200 and contradicts it.
+        const reportStreamError = frame => {
+          const failure = sseError(frame);
+          if (failure) {
+            debugLog({
+              event: 'upstream_error', status: response.status, stream: true,
+              ...errorSummary(failure, secrets),
+            });
+          }
+        };
         for await (const chunk of response.body) {
           active();
           buffer += decoder.decode(chunk, { stream: true });
@@ -861,18 +1186,33 @@ async function startProxy(upstream, token, idleSeconds) {
           while ((match = /\r?\n\r?\n/.exec(buffer))) {
             const frame = buffer.slice(0, match.index);
             buffer = buffer.slice(match.index + match[0].length);
+            reportStreamError(frame);
             if (!res.write(sseFrame(frame, names) + '\n\n')) await once(res, 'drain', { signal: abort.signal });
           }
         }
         buffer += decoder.decode();
-        if (buffer) res.write(sseFrame(buffer, names) + '\n\n');
+        if (buffer) {
+          reportStreamError(buffer);
+          res.write(sseFrame(buffer, names) + '\n\n');
+        }
         res.end();
       } else if (response.headers.get('content-type')?.includes('json')) {
-        res.end(JSON.stringify(names.response(JSON.parse((await collect(response.body, active)).toString('utf8')))));
+        const text = (await collect(response.body, active)).toString('utf8');
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(text, secrets) });
+        res.end(JSON.stringify(names.response(parseJson(text, 'The upstream reply'))));
       } else {
-        res.end(await collect(response.body, active));
+        const buffered = await collect(response.body, active);
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(buffered, secrets) });
+        res.end(buffered);
       }
     } catch (error) {
+      // The last string from outside this file that reached the log unscrubbed.
+      // A fault here is the adapter's own to report, but the sentence reporting
+      // it is written by Node, and it quotes what it was given.
+      debugLog({
+        event: 'adapter_error', name: error && error.name,
+        message: redact(String((error && error.message) || ''), secrets).slice(0, ERROR_MESSAGE_LIMIT),
+      });
       const refused = error instanceof UnsupportedRequest;
       if (!res.headersSent) {
         res.writeHead(refused ? 400 : 502, { 'content-type': 'application/json' });
@@ -892,7 +1232,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -904,7 +1244,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs,
+  parseEnvFile, loadConfig, scrubEnv, buildChildEnv, claudeArgs, debugTarget, openDebugLog,
   findOnPath, targetFromShim, resolveClaude, claudeNames, spawnOptions, signalPlan, hasControllingTerminal, exitStatus,
 } = require('./launcher.cjs');
 
@@ -915,6 +1255,37 @@ function tempDir() {
   test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+
+test('a debug log is opened before the run starts, private, and never over a name already taken', () => {
+  const dir = tempDir();
+  const generated = path.join(dir, 'generated.log');
+  openDebugLog(generated, false);
+  // Opened, not merely tested for: the path the launcher is about to announce
+  // exists by the time it says so.
+  assert.equal(fs.existsSync(generated), true);
+  // The default lands in a directory every account on the machine can write to,
+  // so the rights are set at creation rather than left to the umask. Windows
+  // has no POSIX mode to read back.
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(generated).mode & 0o777, 0o600);
+  }
+  // A name this program invented is created exclusively. One already sitting
+  // there was put there by somebody else - a symlink into another file, in a
+  // directory anyone can write to - and appending to it is the thing to refuse.
+  assert.throws(() => openDebugLog(generated, false), /cannot write the debug log/);
+
+  // A path the user named is appended to, existing or not: two runs into one
+  // file keep both.
+  const named = path.join(dir, 'named.log');
+  fs.writeFileSync(named, 'earlier\n');
+  openDebugLog(named, true);
+  assert.equal(fs.readFileSync(named, 'utf8'), 'earlier\n');
+
+  assert.throws(
+    () => openDebugLog(path.join(dir, 'absent', 'x.log'), true),
+    error => /cannot write the debug log/.test(error.message) && /ENOENT/.test(error.message)
+  );
+});
 
 test('high is the default effort but an explicit CLI effort wins', () => {
   assert.deepEqual(claudeArgs(['-p', 'hello'], 'high'), ['--effort', 'high', '-p', 'hello']);
@@ -1159,6 +1530,34 @@ test('a killed child reports its own signal, not a blanket 143', () => {
   assert.equal(exitStatus(null, 'NOT_A_SIGNAL'), 143);
   assert.equal(exitStatus(null, null), 143);
 });
+
+test('the debug flag is stripped from the arguments and names a log file', () => {
+  const off = debugTarget(['-p', 'hi']);
+  assert.deepEqual(off.args, ['-p', 'hi']);
+  assert.equal(off.log, null);
+  const bare = debugTarget(['-p', 'hi', '--muse-debug'], '/logs', 7, 'd15c');
+  assert.deepEqual(bare.args, ['-p', 'hi']);
+  assert.equal(bare.log, path.join('/logs', 'claude-muse-7-d15c.log'));
+  assert.equal(bare.chosen, false);
+  // Two runs in the same millisecond still get different files, which is the
+  // property a timestamp alone does not have.
+  assert.notEqual(
+    debugTarget(['--muse-debug'], '/logs', 7).log,
+    debugTarget(['--muse-debug'], '/logs', 7).log
+  );
+  const chosen = debugTarget(['--muse-debug=/logs/chosen.log', '-p', 'hi']);
+  assert.deepEqual(chosen.args, ['-p', 'hi']);
+  assert.equal(chosen.log, '/logs/chosen.log');
+  assert.equal(chosen.chosen, true);
+});
+
+test('a bare debug flag never consumes the argument after it', () => {
+  // `claude-muse --muse-debug "write a test"` must still send the prompt to
+  // Claude Code. Reading the path from the next argument would eat it instead.
+  const { args, log } = debugTarget(['--muse-debug', 'write a test'], '/logs', 7, 'd15c');
+  assert.deepEqual(args, ['write a test']);
+  assert.equal(log, path.join('/logs', 'claude-muse-7-d15c.log'));
+});
 ```
 
 Create `~/.local/lib/claude-muse/adapter.test.cjs` with this exact content:
@@ -1168,8 +1567,11 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, UnsupportedRequest } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -1247,6 +1649,324 @@ test('HTTP authentication, request mapping, fragmented UTF-8 SSE, and error stat
     proxy.server.closeAllConnections(); proxy.server.close();
     upstream.closeAllConnections(); upstream.close();
   }
+});
+
+test('stop_sequences never reaches the provider', async () => {
+  let received;
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"type":"message"}');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    const response = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', stop_sequences: ['</verdict>'], messages: [{ content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    // Asserted on the body the provider received, not on the helper alone: a
+    // helper that works but is never called is the failure this guards against.
+    assert.equal('stop_sequences' in received, false);
+    assert.deepEqual(received.messages, [{ content: 'hi' }]);
+    assert.equal(received.model, 'm');
+  } finally {
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('the debug log names an upstream failure and never the credential', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    // Not JSON, and not from the provider at all: a gateway standing in front of
+    // it, quoting the whole request back. This is the second of the two branches
+    // that log a failure, and it is reached by content type, so it needs a reply
+    // of its own to be exercised.
+    if (req.url === '/v1/gateway') {
+      res.writeHead(502, { 'content-type': 'text/html' });
+      res.end('<html>refused Bearer upstream-test-key carrying the-content-of-a-turn</html>');
+      return;
+    }
+    // The parameters are the provider's to write, and this one puts the
+    // credential it rejected in them. The header never reaches the log, so the
+    // assertion below that the key is absent covers this branch too.
+    res.writeHead(400, { 'content-type': 'application/json; charset=utf-8; note=upstream-test-key' });
+    // Written the way a provider that quotes what it refused writes one: the
+    // sentence worth keeping, and beside it the request and the authorization
+    // it just rejected. Nothing stops an upstream from replying like this, so
+    // the log has to survive it.
+    res.end(JSON.stringify({
+      error: { message: '`stop_sequences` is not supported' },
+      request: { messages: [{ content: 'the-content-of-a-turn' }] },
+      authorization: 'Bearer upstream-test-key',
+    }));
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const file = path.join(os.tmpdir(), 'muse-debug-' + process.pid + '.log');
+  fs.rmSync(file, { force: true });
+  process.env.MUSE_DEBUG_LOG = file;
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    // Deliberately not ASCII. The decoded string is shorter than the body that
+    // travelled, so a count taken from it is wrong in exactly the direction
+    // that matters.
+    const sent = JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'Привет, 世界' }] });
+    assert.ok(Buffer.byteLength(sent, 'utf8') > sent.length);
+    await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: sent,
+    });
+    await fetch(proxy.url + '/v1/gateway', {
+      headers: { authorization: 'Bearer ' + proxy.token },
+    });
+    const log = fs.readFileSync(file, 'utf8');
+    assert.match(log, /"event":"request"/);
+    assert.match(log, /"event":"upstream_error"/);
+    // The field that was refused is still there to read, which is what the log
+    // is for.
+    assert.match(log, /stop_sequences/);
+    // Both failures were recorded, and neither carried the body that named
+    // them. Asserted on the file as a whole: a leak through either branch is
+    // the same leak.
+    assert.equal(log.match(/"event":"upstream_error"/g).length, 2);
+    assert.match(log, /"status":502[^\n]*"unrecognized":true/);
+    assert.match(log, new RegExp('"bytes":' + Buffer.byteLength(sent, 'utf8') + '[,}]'));
+    assert.equal(log.includes('upstream-test-key'), false);
+    assert.equal(log.includes('the-content-of-a-turn'), false);
+    // The body was counted, never copied.
+    assert.equal(log.includes('Привет'), false);
+  } finally {
+    delete process.env.MUSE_DEBUG_LOG;
+    fs.rmSync(file, { force: true });
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('an upstream error reaches the log by what it declares, never by its body', () => {
+  const summary = errorSummary(JSON.stringify({
+    error: { type: 'invalid_request_error', message: '`stop_sequences` is not supported' },
+    request: { messages: [{ content: 'the content of a turn' }] },
+  }));
+  assert.equal(summary.type, 'invalid_request_error');
+  assert.equal(summary.message, '`stop_sequences` is not supported');
+  // The sentence that names the field is kept; everything standing next to it
+  // in the same body is not. Asserted over the whole entry, because a field
+  // added later would carry the leak back in without failing a narrower check.
+  assert.equal(JSON.stringify(summary).includes('the content of a turn'), false);
+
+  // A gateway in front of the provider states the same two fields at the top
+  // level of the body rather than under `error`.
+  const gateway = '{"type":"rate_limit_error","message":"slow down"}';
+  assert.deepEqual(
+    errorSummary(gateway),
+    { bytes: Buffer.byteLength(gateway, 'utf8'), type: 'rate_limit_error', message: 'slow down' }
+  );
+
+  // A credential echoed back is struck out by value, which works wherever in
+  // the sentence the provider chose to put it.
+  const echoed = errorSummary('{"message":"Bearer upstream-key-value was rejected"}', ['upstream-key-value']);
+  assert.equal(echoed.message, 'Bearer [redacted] was rejected');
+
+  // A credential is a credential at any length: nothing validates how long a
+  // configured token is, so a guarantee that held only above some length would
+  // hold for some keys and not others.
+  assert.equal(errorSummary('{"message":"key abc rejected"}', ['abc']).message, 'key [redacted] rejected');
+  // The empty string is the one value that cannot be searched for - splitting on
+  // it would return the text one character at a time. It leaves the text alone.
+  assert.equal(errorSummary('{"message":"hello"}', ['']).message, 'hello');
+});
+
+test('a long message is redacted before it is capped, and an unfamiliar body is measured', () => {
+  const long = errorSummary(JSON.stringify({ error: { message: 'x'.repeat(400) + 'the tail of a turn' } }));
+  assert.equal(long.message.length, 300);
+  assert.equal(long.truncated, true);
+  assert.equal(long.message.includes('the tail of a turn'), false);
+
+  // The credential lies across the 300-character cap. Cut first, its tail goes
+  // with the cut, the exact-match search finds nothing, and the head of the
+  // token stays in the log - the cap defeating the redaction.
+  const secret = 'sk-' + 'a'.repeat(40);
+  const straddling = errorSummary(
+    JSON.stringify({ error: { message: 'x'.repeat(290) + secret + ' was rejected' } }),
+    [secret]
+  );
+  assert.equal(straddling.message.includes('sk-'), false);
+  assert.equal(straddling.message, 'x'.repeat(290) + '[redacted]');
+  assert.equal(straddling.truncated, true);
+
+  // Redaction shortens the text, so a message over the cap before scrubbing can
+  // fit under it after - and then nothing was cut. `truncated` describes the
+  // sentence in the log, not the one that arrived.
+  const shortened = errorSummary(
+    JSON.stringify({ error: { message: 'x'.repeat(267) + secret } }),
+    [secret]
+  );
+  assert.equal(shortened.message, 'x'.repeat(267) + '[redacted]');
+  assert.equal('truncated' in shortened, false);
+
+  // A type is a string the provider chooses too, so it is bounded as well.
+  const shouting = errorSummary(JSON.stringify({ error: { type: 'e'.repeat(400) } }));
+  assert.equal(shouting.type.length, 300);
+
+  // A gateway's HTML page declares nothing this can read. It is still worth an
+  // entry - "refused, and said something unreadable" is not "nothing came
+  // back" - but it is recorded by size, not by content.
+  const page = '<html><body>token=abc, prompt was: the content of a turn</body></html>';
+  const unfamiliar = errorSummary(page);
+  assert.deepEqual(unfamiliar, { bytes: Buffer.byteLength(page, 'utf8'), unrecognized: true });
+});
+
+test('a malformed body is reported by name, never by an excerpt of itself', () => {
+  assert.deepEqual(parseJson('{"a":1}', 'The request body'), { a: 1 });
+  // `JSON.parse` puts a window of its input into the SyntaxError it throws, and
+  // for these bodies that window is the content of a turn. The message this
+  // raises instead is fixed, so nothing of the body can travel in it.
+  assert.throws(
+    () => parseJson('{"messages":[{"content":"the content of a turn"}], "model": bad}', 'The request body'),
+    error => error.message === 'The request body is not valid JSON'
+  );
+});
+
+test('a debug log that cannot be written says so once and does not break the turn', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  // A directory that does not exist, which is what `--muse-debug=<path>` names
+  // when a user mistypes it or points at a drive that is not mounted.
+  process.env.MUSE_DEBUG_LOG = path.join(os.tmpdir(), 'muse-absent-' + process.pid, 'nested', 'x.log');
+  const said = [];
+  const spoke = console.error;
+  console.error = message => said.push(String(message));
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(proxy.url + '/v1/messages', {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'm', messages: [] }),
+      });
+      // The turn is what matters. A log that cannot be written must not cost
+      // the request it was turned on to explain.
+      assert.equal(response.status, 200);
+    }
+  } finally {
+    console.error = spoke;
+    delete process.env.MUSE_DEBUG_LOG;
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+  // Two requests, three log attempts each, one sentence. Silence here is the
+  // bug: the launcher announced a path the user would have watched all session.
+  assert.equal(said.length, 1);
+  assert.match(said[0], /cannot write the request log/);
+  assert.match(said[0], /ENOENT/);
+});
+
+test('an error inside a streaming reply is logged, not read as a success', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    // 200, then a failure. The status line was already committed when the
+    // provider found out how the turn ends.
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"upstream is overloaded"}}\n\n');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const file = path.join(os.tmpdir(), 'muse-stream-' + process.pid + '.log');
+  fs.rmSync(file, { force: true });
+  process.env.MUSE_DEBUG_LOG = file;
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    const response = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', stream: true, messages: [] }),
+    });
+    // Forwarded untouched: the client is the one that has to act on it.
+    assert.ok((await response.text()).includes('overloaded_error'));
+    const log = fs.readFileSync(file, 'utf8');
+    // The 200 is still recorded, and the failure sits beside it contradicting
+    // it. Without the second line the turn reads as having worked.
+    assert.match(log, /"event":"response","status":200/);
+    assert.match(log, /"event":"upstream_error","status":200,"stream":true/);
+    assert.match(log, /"type":"overloaded_error"/);
+    assert.match(log, /upstream is overloaded/);
+  } finally {
+    delete process.env.MUSE_DEBUG_LOG;
+    fs.rmSync(file, { force: true });
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('the logged content type is a media type and nothing else', () => {
+  assert.equal(mediaType('application/json'), 'application/json');
+  assert.equal(mediaType('text/event-stream; charset=utf-8'), 'text/event-stream');
+  assert.equal(mediaType('APPLICATION/JSON'), 'application/json');
+  assert.equal(mediaType('application/vnd.api+json'), 'application/vnd.api+json');
+  // A header is written upstream, and the parameters are where anything can be
+  // put. They are dropped rather than trusted.
+  assert.equal(mediaType('application/json; key=LLM|123|secret'), 'application/json');
+  // A value that is not a media type is not quoted in its place. `null` still
+  // separates "the reply declared something unreadable" from "no reply".
+  assert.equal(mediaType('Bearer LLM|123|secret'), null);
+  assert.equal(mediaType('application/json LLM|123|secret'), null);
+  assert.equal(mediaType(null), null);
+});
+
+test('an adapter error never carries a credential out of the configured URL', async () => {
+  const file = path.join(os.tmpdir(), 'muse-adapter-' + process.pid + '.log');
+  fs.rmSync(file, { force: true });
+  process.env.MUSE_DEBUG_LOG = file;
+  // A gateway written with userinfo. `fetch` refuses the URL and says so by
+  // quoting the whole of it, so this is not a rare path - it is every request
+  // this configuration ever makes.
+  // The long path is deliberate: the message quotes the URL, so it is what
+  // makes this error long enough to prove the cap holds here too.
+  const proxy = await startProxy('https://muse-user:muse-password@127.0.0.1:1/v1/' + 'p'.repeat(400), 'upstream-test-key');
+  try {
+    const response = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(response.status, 502);
+    const log = fs.readFileSync(file, 'utf8');
+    // The fault is still named - that is what the entry is for.
+    assert.match(log, /"event":"adapter_error"/);
+    assert.match(log, /\[redacted\]/);
+    assert.equal(log.includes('muse-password'), false);
+    assert.equal(log.includes('muse-user'), false);
+    // Bounded like every other provider-written string that reaches the log.
+    const entry = JSON.parse(log.split('\n').find(line => line.includes('"adapter_error"')));
+    assert.equal(entry.message.length, 300);
+  } finally {
+    delete process.env.MUSE_DEBUG_LOG;
+    fs.rmSync(file, { force: true });
+    proxy.server.closeAllConnections(); proxy.server.close();
+  }
+});
+
+test('an ordinary streaming frame is not mistaken for a failure', () => {
+  assert.equal(sseError('event: message_start\ndata: {"type":"message_start"}'), null);
+  assert.equal(sseError('data: [DONE]'), null);
+  // A frame this cannot read belongs to `sseFrame` to report; a diagnostic must
+  // not be what ends a stream.
+  assert.equal(sseError('data: {not json'), null);
+  assert.equal(
+    sseError('event: error\ndata: {"type":"error","error":{"message":"gone"}}'),
+    '{"type":"error","error":{"message":"gone"}}'
+  );
 });
 
 test('cache_control keeps only its type, everywhere it can appear', () => {
@@ -1469,6 +2189,64 @@ your Claude Code settings, or turn the WebSearch tool off.
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
 
+## Auto mode
+
+Claude Code's auto mode asks the model whether a tool call is safe before
+running it, on a separate request that carries no tools and does not stream.
+That request includes `stop_sequences`, which Meta rejects with HTTP 400, and
+Claude Code renders the refusal as "the model is temporarily unavailable". The
+symptom names nothing useful: Bash, Edit and Agent all fail while reading files
+keeps working, because read-only tools are not gated. The adapter drops the
+field, which costs where generation stops and buys a mode that would otherwise
+never run at all.
+
+## Diagnosing an unsupported field
+
+Meta refuses one field at a time, and most of those refusals reach the user as
+that same "temporarily unavailable" sentence, which names neither the request
+nor the field. `claude-muse --muse-debug` turns on a request log for one run and
+prints the path it is writing to; `--muse-debug=<path>` chooses the file, and
+`MUSE_DEBUG_LOG` in the environment does the same thing for a session that is
+already scripted.
+
+The flag is namespaced rather than plain `--debug` because Claude Code has a
+`--debug` of its own, and taking that name here would remove a flag from the
+program this launcher exists to run. The launcher strips its own flag from the
+arguments; everything else passes through untouched.
+
+Each line of the log is one JSON object: the shape of a request (model, whether
+it streams, how many tools, the longest tool name), the status of the reply, the
+`type` and `message` a failing reply declares about itself, and any request the
+proxy turned away before forwarding it. Headers, the key and the content of
+messages are never written.
+
+An error body is never copied, which is what keeps that last sentence true. A
+provider is free to quote the request it objected to, or the authorization it
+just rejected, and a body copied whole would carry both into the log. Only those
+two declared fields are lifted out, capped at 300 characters, and scrubbed of
+every credential the process holds; a body shaped like anything else — a
+gateway's HTML page, say — is recorded by size alone. That is still enough to
+name an unsupported field, which is what the log is for.
+
+A streaming reply is recorded the same way. The provider commits to its status
+line before it knows how the turn ends, so a 200 can open a stream and then
+carry `event: error` - overloaded, context too long, refused. That failure is
+logged beside the 200 rather than left to contradict nothing.
+
+The file is created `0600`, and the name the flag generates when given no path
+carries random bytes as well as a timestamp: the default lands in a directory
+every account on the machine can write to, where a predictable name is one
+another account can leave a symlink under. A generated name is claimed
+exclusively, so one already taken stops the run instead of being appended to. A
+path you name yourself is yours - it is appended to, and keeps the rights it
+has.
+
+With neither the flag nor the variable, nothing is logged and no file is opened.
+
+Three of the four provider incompatibilities in this document were found this
+way rather than predicted, so reach for the log first when a tool stops working,
+not last.
+
 ## Long turns
 
 The adapter gives up on a request after `MUSE_IDLE_TIMEOUT_SECONDS` of complete
@@ -1622,6 +2400,9 @@ Why the local adapter is required:
   it. During integration tests Muse also generated incorrect `default.`-prefixed
   names and omitted required arguments after deferred loading. Direct schema
   loading was reliable after aliasing.
+- Meta rejects `stop_sequences` with HTTP 400, and Claude Code sends it on the
+  auto-mode safety classifier call. Without the adapter, auto mode cannot judge
+  any gated tool and reports the model as unavailable instead.
 
 Why Claude Code is started the way it is on Windows:
 
@@ -1722,8 +2503,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are twenty-three offline tests in total: ten in `adapter.test.cjs` and
-thirteen in `launcher.test.cjs`. All twenty-three must pass on both platforms;
+There are thirty-six offline tests in total: twenty in `adapter.test.cjs` and
+sixteen in `launcher.test.cjs`. All thirty-six must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -1774,6 +2555,11 @@ explicitly:
 - `400` mentioning a tool name over 64 characters: verify that Claude Code is
   running through the local adapter and that the alias transformation covers
   the named block.
+- `400` naming any other unsupported field: rerun with `--muse-debug` and read
+  the `upstream_error` line in the log. It names the field.
+- Claude Code reporting the model as temporarily unavailable while read-only
+  tools keep working: that is auto mode's classifier failing, not an outage.
+  Check the log before believing the message.
 
 Then run a cheap Claude Code smoke test with no customizations or tools.
 
