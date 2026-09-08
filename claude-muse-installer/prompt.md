@@ -1067,6 +1067,13 @@ function sseFrame(frame, names) {
 async function startProxy(upstream, token, idleSeconds) {
   const origin = new URL(upstream);
   const localToken = randomBytes(32).toString('hex');
+  // Every string whose exact value is known and must never reach the log,
+  // gathered once so no path out of this file can be given a shorter list than
+  // another. The configured URL carries credentials of its own when a gateway
+  // is written as `https://user:password@host`, and `fetch` refuses such a URL
+  // by throwing an error that quotes the whole of it - on every request, not on
+  // some rare path.
+  const secrets = [token, localToken, origin.password, origin.username].filter(Boolean);
   // Idle, not wall-clock. A high-effort turn over a large context can stream for
   // far longer than any fixed cutoff, and aborting a healthy stream mid-flight
   // would truncate the turn: the headers have already gone out, so there is no
@@ -1168,7 +1175,7 @@ async function startProxy(upstream, token, idleSeconds) {
           if (failure) {
             debugLog({
               event: 'upstream_error', status: response.status, stream: true,
-              ...errorSummary(failure, [token, localToken]),
+              ...errorSummary(failure, secrets),
             });
           }
         };
@@ -1191,15 +1198,21 @@ async function startProxy(upstream, token, idleSeconds) {
         res.end();
       } else if (response.headers.get('content-type')?.includes('json')) {
         const text = (await collect(response.body, active)).toString('utf8');
-        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(text, [token, localToken]) });
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(text, secrets) });
         res.end(JSON.stringify(names.response(parseJson(text, 'The upstream reply'))));
       } else {
         const buffered = await collect(response.body, active);
-        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(buffered, [token, localToken]) });
+        if (response.status >= 400) debugLog({ event: 'upstream_error', status: response.status, ...errorSummary(buffered, secrets) });
         res.end(buffered);
       }
     } catch (error) {
-      debugLog({ event: 'adapter_error', name: error && error.name, message: error && error.message });
+      // The last string from outside this file that reached the log unscrubbed.
+      // A fault here is the adapter's own to report, but the sentence reporting
+      // it is written by Node, and it quotes what it was given.
+      debugLog({
+        event: 'adapter_error', name: error && error.name,
+        message: redact(String((error && error.message) || ''), secrets).slice(0, ERROR_MESSAGE_LIMIT),
+      });
       const refused = error instanceof UnsupportedRequest;
       if (!res.headersSent) {
         res.writeHead(refused ? 400 : 502, { 'content-type': 'application/json' });
@@ -1911,6 +1924,39 @@ test('the logged content type is a media type and nothing else', () => {
   assert.equal(mediaType(null), null);
 });
 
+test('an adapter error never carries a credential out of the configured URL', async () => {
+  const file = path.join(os.tmpdir(), 'muse-adapter-' + process.pid + '.log');
+  fs.rmSync(file, { force: true });
+  process.env.MUSE_DEBUG_LOG = file;
+  // A gateway written with userinfo. `fetch` refuses the URL and says so by
+  // quoting the whole of it, so this is not a rare path - it is every request
+  // this configuration ever makes.
+  // The long path is deliberate: the message quotes the URL, so it is what
+  // makes this error long enough to prove the cap holds here too.
+  const proxy = await startProxy('https://muse-user:muse-password@127.0.0.1:1/v1/' + 'p'.repeat(400), 'upstream-test-key');
+  try {
+    const response = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(response.status, 502);
+    const log = fs.readFileSync(file, 'utf8');
+    // The fault is still named - that is what the entry is for.
+    assert.match(log, /"event":"adapter_error"/);
+    assert.match(log, /\[redacted\]/);
+    assert.equal(log.includes('muse-password'), false);
+    assert.equal(log.includes('muse-user'), false);
+    // Bounded like every other provider-written string that reaches the log.
+    const entry = JSON.parse(log.split('\n').find(line => line.includes('"adapter_error"')));
+    assert.equal(entry.message.length, 300);
+  } finally {
+    delete process.env.MUSE_DEBUG_LOG;
+    fs.rmSync(file, { force: true });
+    proxy.server.closeAllConnections(); proxy.server.close();
+  }
+});
+
 test('an ordinary streaming frame is not mistaken for a failure', () => {
   assert.equal(sseError('event: message_start\ndata: {"type":"message_start"}'), null);
   assert.equal(sseError('data: [DONE]'), null);
@@ -2457,8 +2503,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-five offline tests in total: nineteen in `adapter.test.cjs` and
-sixteen in `launcher.test.cjs`. All thirty-five must pass on both platforms;
+There are thirty-six offline tests in total: twenty in `adapter.test.cjs` and
+sixteen in `launcher.test.cjs`. All thirty-six must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
