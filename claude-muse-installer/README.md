@@ -5,7 +5,7 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs thirty-two offline
+detects the platform once and follows only that branch; it writes the files, runs thirty-four offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
@@ -24,7 +24,7 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
 ~/.local/lib/claude-muse/launcher.test.cjs   sixteen offline tests
-~/.local/lib/claude-muse/adapter.test.cjs    sixteen offline tests
+~/.local/lib/claude-muse/adapter.test.cjs    eighteen offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
 ~/.config/claude-muse/provider.env   base URL, model, effort, idle timeout — and your key
 ```
@@ -81,8 +81,12 @@ Headers, the key and the content of messages are never written.
 
 An error body is never copied whole, because a provider may quote the request it refused or the
 authorization it rejected. Only those two declared fields are logged — capped, and scrubbed of any
-credential — and a body of any other shape is recorded by size alone. Without the flag nothing is
-logged and no file is opened.
+credential — and a body of any other shape is recorded by size alone. A streaming reply that fails
+after its `200` is recorded too, beside the status that no longer describes it.
+
+The log is created `0600`, and a generated name carries random bytes as well as a timestamp, because
+the default lands in a directory shared with every other account on the machine. Without the flag
+nothing is logged and no file is opened.
 
 [coding-agents]: https://dev.meta.ai/docs/guides/coding-agents
 

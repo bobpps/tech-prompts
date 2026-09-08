@@ -311,6 +311,7 @@ file is identical on every platform; it decides what to do from
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { randomBytes } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { startProxy } = require('./adapter.cjs');
 
@@ -443,13 +444,21 @@ function buildChildEnv(source, config, windows = WINDOWS) {
 // its own, and taking that name here would remove a flag from the program this
 // launcher exists to run. Only this flag is removed; everything else passes
 // through in the order it was given.
-function debugTarget(args, dir = os.tmpdir(), now = Date.now()) {
+//
+// The generated name carries random bytes as well as the time. The default
+// lands in a directory every account on the machine can write to, and a name
+// that is only a timestamp is a name another account can predict and leave a
+// symlink under - which is how a diagnostic log ends up appended to somebody
+// else's file. Timestamp for a human reading `ls`, randomness for everything
+// else.
+function debugTarget(args, dir = os.tmpdir(), now = Date.now(), nonce = randomBytes(6).toString('hex')) {
   const at = args.findIndex(arg => arg === '--muse-debug' || arg.startsWith('--muse-debug='));
-  if (at === -1) return { args, log: null };
+  if (at === -1) return { args, log: null, chosen: false };
   const chosen = args[at].slice('--muse-debug='.length);
   return {
     args: [...args.slice(0, at), ...args.slice(at + 1)],
-    log: chosen || path.join(dir, 'claude-muse-' + now + '.log'),
+    log: chosen || path.join(dir, 'claude-muse-' + now + '-' + nonce + '.log'),
+    chosen: Boolean(chosen),
   };
 }
 
@@ -464,13 +473,26 @@ function debugTarget(args, dir = os.tmpdir(), now = Date.now()) {
 // written stops the run. The run about to start is the one the user wanted
 // recorded; starting it blind wastes the reproduction, which is the expensive
 // part.
-function openDebugLog(target, append = fs.appendFileSync) {
+//
+// Created private, and created exclusively when this program invented the name.
+// The log holds the shape of every request and the text of every refusal, and
+// the default sits in a directory shared with every other account on the
+// machine, where `022` would otherwise publish it as `0644`. `0600` applies
+// only to a file this call creates; a path the user already owns keeps the
+// rights they gave it.
+//
+// `ax` for a generated name, so one already waiting under it - a symlink into
+// another file - is refused instead of appended to. `a` for a path the user
+// named, because appending to a log they already have is the point of naming
+// one.
+function openDebugLog(target, chosen = false, open = fs.openSync, close = fs.closeSync) {
   try {
-    append(target, '');
+    close(open(target, chosen ? 'a' : 'ax', 0o600));
   } catch (error) {
     throw new Error(
       'cannot write the debug log to ' + target + ': ' + ((error && error.code) || (error && error.message)) + '\n' +
-      '  --muse-debug=<path> needs a path in a directory that exists and is writable.'
+      '  --muse-debug=<path> needs a path in a directory that exists and is writable,\n' +
+      '  and a generated log name must not already exist.'
     );
   }
 }
@@ -633,7 +655,7 @@ async function main() {
   // path to the environment has to wait until after the child environment is
   // built, further down, or Claude Code inherits it.
   const debug = debugTarget(process.argv.slice(2));
-  if (debug.log) openDebugLog(debug.log);
+  if (debug.log) openDebugLog(debug.log, debug.chosen);
   const config = loadConfig();
   const target = resolveClaude();
   if (!target) {
@@ -729,7 +751,10 @@ function debugLog(entry) {
   const target = process.env.MUSE_DEBUG_LOG;
   if (!target) return;
   try {
-    fs.appendFileSync(target, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+    // The launcher opens its own target `0600`, but `MUSE_DEBUG_LOG` set in the
+    // environment never passes through it. Applied only when this call creates
+    // the file.
+    fs.appendFileSync(target, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n', { mode: 0o600 });
   } catch (error) {
     // Never thrown: a diagnostic that breaks the turn it was meant to explain
     // is worse than no diagnostic at all. Never silent either - a user told the
@@ -987,9 +1012,35 @@ async function collect(body, active) {
   return Buffer.concat(chunks);
 }
 
+// A streaming reply commits to its status line before it knows how the turn
+// ends. The provider answers 200, opens the stream, and can still emit
+// `event: error` a second later - upstream overloaded, context too long, the
+// turn refused. Nothing about that reaches the status the log already recorded,
+// so a failed turn read as a successful one, which is the reading that sends a
+// user looking at their own machine.
+//
+// Returns the data of an error event, for `errorSummary` to reduce to the two
+// fields it declares, and null for everything else. Never throws: a frame this
+// cannot parse is `sseFrame`'s to report, and a diagnostic must not be what
+// ends a stream.
+function sseError(frame) {
+  const data = sseData(frame);
+  if (!data || data === '[DONE]') return null;
+  let parsed;
+  try { parsed = JSON.parse(data); } catch { return null; }
+  return parsed && parsed.type === 'error' ? data : null;
+}
+
+function sseData(frame) {
+  return frame.split(/\r?\n/)
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).replace(/^ /, ''))
+    .join('\n');
+}
+
 function sseFrame(frame, names) {
   const lines = frame.split(/\r?\n/);
-  const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
+  const data = sseData(frame);
   if (!data || data === '[DONE]') return frame;
   const body = names.response(parseJson(data, 'An upstream event'));
   return [...lines.filter(l => !l.startsWith('data:')), 'data: ' + JSON.stringify(body)].join('\n');
@@ -1092,6 +1143,17 @@ async function startProxy(upstream, token, idleSeconds) {
       if (response.headers.get('content-type')?.includes('text/event-stream')) {
         const decoder = new TextDecoder();
         let buffer = '';
+        // Read from the frames on their way through, so the entry sits beside
+        // the `response` line that recorded the 200 and contradicts it.
+        const reportStreamError = frame => {
+          const failure = sseError(frame);
+          if (failure) {
+            debugLog({
+              event: 'upstream_error', status: response.status, stream: true,
+              ...errorSummary(failure, [token, localToken]),
+            });
+          }
+        };
         for await (const chunk of response.body) {
           active();
           buffer += decoder.decode(chunk, { stream: true });
@@ -1099,11 +1161,15 @@ async function startProxy(upstream, token, idleSeconds) {
           while ((match = /\r?\n\r?\n/.exec(buffer))) {
             const frame = buffer.slice(0, match.index);
             buffer = buffer.slice(match.index + match[0].length);
+            reportStreamError(frame);
             if (!res.write(sseFrame(frame, names) + '\n\n')) await once(res, 'drain', { signal: abort.signal });
           }
         }
         buffer += decoder.decode();
-        if (buffer) res.write(sseFrame(buffer, names) + '\n\n');
+        if (buffer) {
+          reportStreamError(buffer);
+          res.write(sseFrame(buffer, names) + '\n\n');
+        }
         res.end();
       } else if (response.headers.get('content-type')?.includes('json')) {
         const text = (await collect(response.body, active)).toString('utf8');
@@ -1135,7 +1201,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -1159,21 +1225,33 @@ function tempDir() {
   return dir;
 }
 
-test('a debug log that cannot be written is refused before the run starts', () => {
+test('a debug log is opened before the run starts, private, and never over a name already taken', () => {
   const dir = tempDir();
-  const usable = path.join(dir, 'fine.log');
-  openDebugLog(usable);
+  const generated = path.join(dir, 'generated.log');
+  openDebugLog(generated, false);
   // Opened, not merely tested for: the path the launcher is about to announce
   // exists by the time it says so.
-  assert.equal(fs.existsSync(usable), true);
-  // An existing log is appended to, never truncated - two runs into one file
-  // keep both.
-  fs.writeFileSync(usable, 'earlier\n');
-  openDebugLog(usable);
-  assert.equal(fs.readFileSync(usable, 'utf8'), 'earlier\n');
+  assert.equal(fs.existsSync(generated), true);
+  // The default lands in a directory every account on the machine can write to,
+  // so the rights are set at creation rather than left to the umask. Windows
+  // has no POSIX mode to read back.
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(generated).mode & 0o777, 0o600);
+  }
+  // A name this program invented is created exclusively. One already sitting
+  // there was put there by somebody else - a symlink into another file, in a
+  // directory anyone can write to - and appending to it is the thing to refuse.
+  assert.throws(() => openDebugLog(generated, false), /cannot write the debug log/);
+
+  // A path the user named is appended to, existing or not: two runs into one
+  // file keep both.
+  const named = path.join(dir, 'named.log');
+  fs.writeFileSync(named, 'earlier\n');
+  openDebugLog(named, true);
+  assert.equal(fs.readFileSync(named, 'utf8'), 'earlier\n');
 
   assert.throws(
-    () => openDebugLog(path.join(dir, 'absent', 'x.log')),
+    () => openDebugLog(path.join(dir, 'absent', 'x.log'), true),
     error => /cannot write the debug log/.test(error.message) && /ENOENT/.test(error.message)
   );
 });
@@ -1426,20 +1504,28 @@ test('the debug flag is stripped from the arguments and names a log file', () =>
   const off = debugTarget(['-p', 'hi']);
   assert.deepEqual(off.args, ['-p', 'hi']);
   assert.equal(off.log, null);
-  const bare = debugTarget(['-p', 'hi', '--muse-debug'], '/logs', 7);
+  const bare = debugTarget(['-p', 'hi', '--muse-debug'], '/logs', 7, 'd15c');
   assert.deepEqual(bare.args, ['-p', 'hi']);
-  assert.equal(bare.log, path.join('/logs', 'claude-muse-7.log'));
+  assert.equal(bare.log, path.join('/logs', 'claude-muse-7-d15c.log'));
+  assert.equal(bare.chosen, false);
+  // Two runs in the same millisecond still get different files, which is the
+  // property a timestamp alone does not have.
+  assert.notEqual(
+    debugTarget(['--muse-debug'], '/logs', 7).log,
+    debugTarget(['--muse-debug'], '/logs', 7).log
+  );
   const chosen = debugTarget(['--muse-debug=/logs/chosen.log', '-p', 'hi']);
   assert.deepEqual(chosen.args, ['-p', 'hi']);
   assert.equal(chosen.log, '/logs/chosen.log');
+  assert.equal(chosen.chosen, true);
 });
 
 test('a bare debug flag never consumes the argument after it', () => {
   // `claude-muse --muse-debug "write a test"` must still send the prompt to
   // Claude Code. Reading the path from the next argument would eat it instead.
-  const { args, log } = debugTarget(['--muse-debug', 'write a test'], '/logs', 7);
+  const { args, log } = debugTarget(['--muse-debug', 'write a test'], '/logs', 7, 'd15c');
   assert.deepEqual(args, ['write a test']);
-  assert.equal(log, path.join('/logs', 'claude-muse-7.log'));
+  assert.equal(log, path.join('/logs', 'claude-muse-7-d15c.log'));
 });
 ```
 
@@ -1454,7 +1540,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -1744,6 +1830,55 @@ test('a debug log that cannot be written says so once and does not break the tur
   assert.match(said[0], /ENOENT/);
 });
 
+test('an error inside a streaming reply is logged, not read as a success', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    // 200, then a failure. The status line was already committed when the
+    // provider found out how the turn ends.
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"upstream is overloaded"}}\n\n');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const file = path.join(os.tmpdir(), 'muse-stream-' + process.pid + '.log');
+  fs.rmSync(file, { force: true });
+  process.env.MUSE_DEBUG_LOG = file;
+  const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
+  try {
+    const response = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', stream: true, messages: [] }),
+    });
+    // Forwarded untouched: the client is the one that has to act on it.
+    assert.ok((await response.text()).includes('overloaded_error'));
+    const log = fs.readFileSync(file, 'utf8');
+    // The 200 is still recorded, and the failure sits beside it contradicting
+    // it. Without the second line the turn reads as having worked.
+    assert.match(log, /"event":"response","status":200/);
+    assert.match(log, /"event":"upstream_error","status":200,"stream":true/);
+    assert.match(log, /"type":"overloaded_error"/);
+    assert.match(log, /upstream is overloaded/);
+  } finally {
+    delete process.env.MUSE_DEBUG_LOG;
+    fs.rmSync(file, { force: true });
+    proxy.server.closeAllConnections(); proxy.server.close();
+    upstream.closeAllConnections(); upstream.close();
+  }
+});
+
+test('an ordinary streaming frame is not mistaken for a failure', () => {
+  assert.equal(sseError('event: message_start\ndata: {"type":"message_start"}'), null);
+  assert.equal(sseError('data: [DONE]'), null);
+  // A frame this cannot read belongs to `sseFrame` to report; a diagnostic must
+  // not be what ends a stream.
+  assert.equal(sseError('data: {not json'), null);
+  assert.equal(
+    sseError('event: error\ndata: {"type":"error","error":{"message":"gone"}}'),
+    '{"type":"error","error":{"message":"gone"}}'
+  );
+});
+
 test('cache_control keeps only its type, everywhere it can appear', () => {
   const body = plainCacheControl({
     system: [{ type: 'text', text: 'a', cache_control: { type: 'ephemeral', ttl: '1h' } }],
@@ -2002,6 +2137,19 @@ two declared fields are lifted out, capped at 300 characters, and scrubbed of
 every credential the process holds; a body shaped like anything else — a
 gateway's HTML page, say — is recorded by size alone. That is still enough to
 name an unsupported field, which is what the log is for.
+
+A streaming reply is recorded the same way. The provider commits to its status
+line before it knows how the turn ends, so a 200 can open a stream and then
+carry `event: error` - overloaded, context too long, refused. That failure is
+logged beside the 200 rather than left to contradict nothing.
+
+The file is created `0600`, and the name the flag generates when given no path
+carries random bytes as well as a timestamp: the default lands in a directory
+every account on the machine can write to, where a predictable name is one
+another account can leave a symlink under. A generated name is claimed
+exclusively, so one already taken stops the run instead of being appended to. A
+path you name yourself is yours - it is appended to, and keeps the rights it
+has.
 
 With neither the flag nor the variable, nothing is logged and no file is opened.
 
@@ -2265,8 +2413,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-two offline tests in total: sixteen in `adapter.test.cjs` and
-sixteen in `launcher.test.cjs`. All thirty-two must pass on both platforms;
+There are thirty-four offline tests in total: eighteen in `adapter.test.cjs` and
+sixteen in `launcher.test.cjs`. All thirty-four must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
