@@ -61,6 +61,41 @@ In a typical setup only one MCP tool name crosses 64 characters, which makes the
 avoidable. It is not: `ENABLE_TOOL_SEARCH=true` changes *when* that definition travels, not
 whether, and one long name fails every request that carries it.
 
+## Why tool search stays off
+
+The launcher pins `ENABLE_TOOL_SEARCH=false`. Deferred Tool Search and the aliasing above cannot
+both be right, and the conflict has no fix inside the adapter.
+
+Aliasing rewrites protocol metadata and only that: a `name` in a tool definition, a `tool_use`
+block, a `tool_reference`. Tool inputs pass through untouched, deliberately, because nothing in a
+string tells the adapter whether it is a tool name or a sentence a tool was handed.
+
+`ToolSearch` puts a tool name in a tool input. Its `select:` query names the tool to load, and
+Claude Code matches that query against the registry it built before anything reached the adapter.
+So the model is shown two spellings of one tool — the real name in a search result, the alias in
+the definition that follows — and a search for the alias matches nothing:
+
+```text
+query  select:mcp__muse_search_probe__lookup_the_installation_marker_for_the_long_name_check
+reply  a tool_reference
+
+query  installation marker
+reply  three tool_references
+
+query  select:muse_lookup_the_installation_marker_for_the_lon_b95636815567c18b
+reply  No matching deferred tools found
+```
+
+The third query is the alias the adapter minted for the tool the first one found. Semantic
+queries keep working, so the session does not look broken; only the round trips that name an
+aliased tool come back empty, and those are the ones the model reaches for once it has a
+definition in hand. Reproduced against a stdio MCP server exposing six tools, one of them 77
+characters once Claude Code had prefixed it.
+
+Un-aliasing a name inside a `ToolSearch` query would mean reading and rewriting tool input, which
+is the one thing this adapter refuses to do — the `cache_control` inside an MCP tool's own schema
+survives for exactly the same reason. Loading every schema directly costs context and settles it.
+
 ## When something stops working
 
 Meta refuses one unsupported field at a time, and Claude Code renders most of those refusals as the
