@@ -1066,7 +1066,13 @@ async function startProxy(upstream, token, idleSeconds) {
         const parsed = parseJson(raw, 'The request body');
         debugLog({
           event: 'request', method: req.method, path: req.url.split('?')[0],
-          model: parsed.model, stream: parsed.stream === true, bytes: raw.length,
+          // What arrived on the socket, already counted by the read loop above.
+          // `raw.length` would be UTF-16 code units of the decoded string: a CJK
+          // character counts one instead of three, so a prompt or a tool schema
+          // in any non-Latin script reports a body far smaller than the one that
+          // was sent - and size is the first thing read when a request is
+          // suspected of being too large.
+          model: parsed.model, stream: parsed.stream === true, bytes: size,
           tools: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
@@ -1586,10 +1592,15 @@ test('the debug log names an upstream failure and never the credential', async (
   process.env.MUSE_DEBUG_LOG = file;
   const proxy = await startProxy('http://127.0.0.1:' + upstream.address().port, 'upstream-test-key');
   try {
+    // Deliberately not ASCII. The decoded string is shorter than the body that
+    // travelled, so a count taken from it is wrong in exactly the direction
+    // that matters.
+    const sent = JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'Привет, 世界' }] });
+    assert.ok(Buffer.byteLength(sent, 'utf8') > sent.length);
     await fetch(proxy.url + '/v1/messages', {
       method: 'POST',
       headers: { authorization: 'Bearer ' + proxy.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'm', messages: [] }),
+      body: sent,
     });
     await fetch(proxy.url + '/v1/gateway', {
       headers: { authorization: 'Bearer ' + proxy.token },
@@ -1605,8 +1616,11 @@ test('the debug log names an upstream failure and never the credential', async (
     // the same leak.
     assert.equal(log.match(/"event":"upstream_error"/g).length, 2);
     assert.match(log, /"status":502[^\n]*"unrecognized":true/);
+    assert.match(log, new RegExp('"bytes":' + Buffer.byteLength(sent, 'utf8') + '[,}]'));
     assert.equal(log.includes('upstream-test-key'), false);
     assert.equal(log.includes('the-content-of-a-turn'), false);
+    // The body was counted, never copied.
+    assert.equal(log.includes('Привет'), false);
   } finally {
     delete process.env.MUSE_DEBUG_LOG;
     fs.rmSync(file, { force: true });
@@ -1632,7 +1646,7 @@ test('an upstream error reaches the log by what it declares, never by its body',
   const gateway = '{"type":"rate_limit_error","message":"slow down"}';
   assert.deepEqual(
     errorSummary(gateway),
-    { bytes: gateway.length, type: 'rate_limit_error', message: 'slow down' }
+    { bytes: Buffer.byteLength(gateway, 'utf8'), type: 'rate_limit_error', message: 'slow down' }
   );
 
   // A credential echoed back is struck out by value, which works wherever in
@@ -1678,7 +1692,7 @@ test('a long message is redacted before it is capped, and an unfamiliar body is 
   // back" - but it is recorded by size, not by content.
   const page = '<html><body>token=abc, prompt was: the content of a turn</body></html>';
   const unfamiliar = errorSummary(page);
-  assert.deepEqual(unfamiliar, { bytes: page.length, unrecognized: true });
+  assert.deepEqual(unfamiliar, { bytes: Buffer.byteLength(page, 'utf8'), unrecognized: true });
 });
 
 test('a malformed body is reported by name, never by an excerpt of itself', () => {
