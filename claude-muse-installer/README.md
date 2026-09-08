@@ -72,8 +72,13 @@ string tells the adapter whether it is a tool name or a sentence a tool was hand
 
 `ToolSearch` puts a tool name in a tool input. Its `select:` query names the tool to load, and
 Claude Code matches that query against the registry it built before anything reached the adapter.
-So the model is shown two spellings of one tool — the real name in a search result, the alias in
-the definition that follows — and a search for the alias matches nothing:
+
+The model is shown two spellings of one tool, and the split follows the adapter's own boundary
+exactly. The listing of deferred tools arrives as message text, which the adapter never rewrites,
+so a real name is what the model reads there. Everything the adapter does rewrite carries the
+alias: the definition a tool is loaded under, and the `tool_reference` inside the search result
+that loaded it. A search quoting the listing therefore succeeds, and the one the model issues
+afterwards — quoting the tool as it now appears in its own definition — matches nothing:
 
 ```text
 query  select:mcp__muse_search_probe__lookup_the_installation_marker_for_the_long_name_check
@@ -86,9 +91,10 @@ query  select:muse_lookup_the_installation_marker_for_the_lon_b95636815567c18b
 reply  No matching deferred tools found
 ```
 
-The third query is the alias the adapter minted for the tool the first one found. Semantic
-queries keep working, so the session does not look broken; only the round trips that name an
-aliased tool come back empty, and those are the ones the model reaches for once it has a
+The third query is the alias the adapter minted for the tool the first one found. The log is the
+session's own view, where a reference still reads as the name it carried before it went out.
+Semantic queries keep working, so the session does not look broken; only the round trips that name
+an aliased tool come back empty, and those are the ones the model reaches for once it has a
 definition in hand. Reproduced against a stdio MCP server exposing six tools, one of them 77
 characters once Claude Code had prefixed it.
 
