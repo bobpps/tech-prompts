@@ -203,6 +203,67 @@ claude-muse --effort low   # override the default effort
 `Path` is set through `[Environment]::SetEnvironmentVariable` rather than `setx`, which truncates
 values at 1024 characters — and the change only reaches newly opened terminals.
 
+## Changing it
+
+The prompt is generated. Its prose lives in `prompt.template.md`, the eight files it dictates live
+in `sources/`, and `prompt.md` is what the two produce:
+
+```text
+claude-muse-installer/
+├── prompt.template.md   the prose, with a marker where each file goes
+├── sources/             the eight files, mirroring the installed tree
+├── build.cjs            template + sources -> prompt.md
+└── prompt.md            generated, committed, and the file you paste
+```
+
+Edit code in `sources/`, never in `prompt.md`, then rebuild and commit both:
+
+```text
+node claude-muse-installer/build.cjs
+```
+
+The checker fails if you forget, and says what to run. Fence length is computed rather than chosen,
+so a file that contains a fence of its own is wrapped in a longer one automatically — including a
+fence indented under three spaces, which CommonMark lets close a block just as one at column zero
+does. That is the failure that once truncated the installed README to a third of its length, and it
+can no longer be written by hand.
+
+Sources are LF only and must end with a newline. `build.cjs` refuses one carrying a carriage return
+and `check.cjs` refuses a prompt that carries one, because a CR copied into the POSIX shim would
+leave `#!/usr/bin/env bash` followed by a carriage return, which is not a shebang. A missing final
+newline is refused for a quieter reason: the block would carry one anyway, so the installed file
+would end up a byte longer than the source it came from, and the copy-over recipe above would stop
+being true.
+
+`sources/` mirrors the installed tree minus the leading dots, so every file sits where its
+installed twin does. The launcher, the adapter, their two suites and the installed README are the
+bytes an install writes, and a machine whose adapter has stopped working is repaired by copying
+one over its twin, with no reinstall:
+
+```text
+cp claude-muse-installer/sources/lib/claude-muse/adapter.cjs ~/.local/lib/claude-muse/
+node --test ~/.local/lib/claude-muse/*.test.cjs
+```
+
+The other three are transformed on the way in, each for a reason, and none of them should be
+copied blind:
+
+- `provider.env` gains the key you paste into it. Never overwrite it from here.
+- `claude-muse.cmd` is written with CRLF, which the prompt itself cannot carry. Convert it on the
+  way if you replace it on Windows: a batch shim with LF endings is not reliably run by
+  `cmd.exe`.
+- `claude-muse`, the POSIX shim, keeps the source verbatim on Linux, macOS and WSL. Under Git Bash
+  its last line is rewritten to resolve the home through Node when the shell's `$HOME` and
+  `os.homedir()` disagree, so check that line before replacing it there — the stock line would
+  send the launcher looking for `provider.env` in a tree the install never wrote to.
+
+The suites also run straight from the repository, which is the fast loop while changing the
+adapter:
+
+```text
+node --test claude-muse-installer/sources/lib/claude-muse/*.test.cjs
+```
+
 ## Checking the prompt
 
 ```text
@@ -210,10 +271,12 @@ node claude-muse-installer/check.cjs
 ```
 
 Extracts all eight files the prompt dictates into a temporary directory, parses the JavaScript,
-runs both test suites, and checks that the test counts quoted in the prose match the counts that
-ran. It also refuses a fenced block that ends early because it contains a fence of its own — the
-failure that once truncated the installed README to a third of its length. No API key, no
-network, about two seconds. It verifies mechanism only; the prose still needs a reader.
+runs both test suites, checks that the test counts quoted in the prose match the counts that ran,
+and rebuilds the prompt from `sources/` to confirm that the file you would paste is the code
+somebody actually edited. It also refuses a fenced block that ends early because it contains a
+fence of its own — the failure that once truncated the installed README to a third of its length.
+No API key, no network, about two seconds. It verifies mechanism only; the prose still needs a
+reader.
 
 ## Source
 

@@ -13,13 +13,22 @@ One directory per prompt:
 
 ```text
 <prompt-name>/
-├── README.md    what it does, requirements, how to run it, what to expect
-├── prompt.md    the prompt text, ready to copy and paste verbatim
-└── check.cjs    optional: verifies whatever in prompt.md can be verified
+├── README.md            what it does, requirements, how to run it, what to expect
+├── prompt.md            the prompt text, ready to copy and paste verbatim
+├── prompt.template.md   optional: the prose, with a marker where each file goes
+├── sources/             optional: the files the prompt dictates, kept as real files
+├── build.cjs            optional: template + sources -> prompt.md
+└── check.cjs            optional: verifies whatever in prompt.md can be verified
 ```
 
 `prompt.md` contains the prompt and nothing else, so the whole file can be copied without
 editing it first. Everything a human needs to know before running it lives in `README.md`.
+
+A prompt that dictates whole files may keep them in `sources/` and generate `prompt.md` from a
+template, so that code can be read, linted, tested and diffed as code rather than as markdown. The
+generated file is committed and the checker compares the two, because the prompt has to stay one
+artifact a reader can audit before pasting it — a link to fetch at install time would move the
+code out of sight at exactly the moment it matters.
 
 ## Checking a prompt
 
