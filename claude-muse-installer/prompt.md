@@ -1097,16 +1097,30 @@ function webSearchTools(body) {
 // and changes nothing the model is shown, and the tool still validates its own
 // arguments when the call arrives.
 //
-// `const`, `default`, `enum` and `examples` hold arbitrary JSON rather than
-// subschemas, so a member named `pattern` inside one of them is a value the
-// tool receives, not a constraint, and is left alone.
+// The match is textual on purpose. A pattern that merely spells `\p` in an
+// escaped position loses a constraint it did not have to lose, which widens
+// what the request may carry and never rejects one; reading regex escape state
+// to avoid that would be more machinery than the failure is worth.
+//
+// Which key means what depends on where it sits. `const`, `default`, `enum`
+// and `examples` hold arbitrary JSON rather than subschemas, so a member named
+// `pattern` inside one of them is a value the tool receives and is left alone.
+// But `properties` and `$defs` map a name the tool chose to a subschema, and
+// those names are not keywords: an argument called `default` is a schema and
+// has to be descended into, or its pattern survives and produces the very 400
+// this prevents. The schema maps are listed rather than detected because
+// missing one puts its subschemas back under keyword rules.
+const UNICODE_PROPERTY = /\\[pP]\{/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
+const SCHEMA_MAPS = ['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'];
 
 function portableSchemas(body) {
   for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);
   return body;
 }
 
+// `node` is a subschema, or an array of them. Anything reached from here is
+// read as a schema unless one of the lists above says otherwise.
 function dropUnicodePatterns(node) {
   if (Array.isArray(node)) {
     for (const item of node) dropUnicodePatterns(item);
@@ -1115,8 +1129,12 @@ function dropUnicodePatterns(node) {
   if (!node || typeof node !== 'object') return;
   for (const [key, value] of Object.entries(node)) {
     if (key === 'pattern' && typeof value === 'string') {
-      if (/\\[pP]\{/.test(value)) delete node[key];
-    } else if (!SCHEMA_VALUES.includes(key)) {
+      if (UNICODE_PROPERTY.test(value)) delete node[key];
+    } else if (SCHEMA_VALUES.includes(key)) {
+      continue;
+    } else if (SCHEMA_MAPS.includes(key)) {
+      if (value && typeof value === 'object') for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+    } else {
       dropUnicodePatterns(value);
     }
   }
@@ -2243,6 +2261,35 @@ test('a pattern that is a value rather than a constraint is left alone', () => {
   assert.equal(props.mode.examples[0].pattern, '\\p{L}');
 });
 
+test('a tool argument named like a schema keyword is still a schema', () => {
+  // `properties` and `$defs` map a name the tool chose to a subschema, and that
+  // name is not a JSON Schema keyword. Reading an argument called `default` or
+  // `enum` as the keyword of the same spelling would skip its schema and leave
+  // the pattern in place, which is the 400 this transform exists to prevent.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    $defs: { enum: { type: 'string', pattern: '\\p{Lu}' } },
+    properties: {
+      default: { type: 'string', pattern: '\\p{L}+' },
+      enum: { type: 'string', pattern: '\\p{N}+' },
+      examples: { items: { type: 'string', pattern: '\\p{M}' } },
+      // A property whose own name is a schema-map keyword is no different.
+      properties: { type: 'string', pattern: '\\p{P}' },
+    },
+    // The same spellings one level up really are keywords, and hold values.
+    default: { pattern: '\\p{L}' },
+    enum: [{ pattern: '\\p{N}' }],
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.properties.default.pattern, undefined);
+  assert.equal(schema.properties.enum.pattern, undefined);
+  assert.equal(schema.properties.examples.items.pattern, undefined);
+  assert.equal(schema.properties.properties.pattern, undefined);
+  assert.equal(schema.$defs.enum.pattern, undefined);
+  assert.equal(schema.default.pattern, '\\p{L}');
+  assert.equal(schema.enum[0].pattern, '\\p{N}');
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
@@ -2771,8 +2818,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are forty offline tests in total: twenty-three in `adapter.test.cjs` and
-seventeen in `launcher.test.cjs`. All forty must pass on both platforms;
+There are forty-one offline tests in total: twenty-four in `adapter.test.cjs`
+and seventeen in `launcher.test.cjs`. All forty-one must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -2900,17 +2947,41 @@ the same prompt-cache path, so it cannot prove the session will work. It also
 sends a different set of tools: the Artifact tool is absent from a print-mode
 run, so a tool schema the provider refuses can end every interactive turn while
 every `-p` check above stays green. Run one more print-mode check with that
-tool forced in, and require the same answer:
+tool forced in, and require the same answer. On POSIX:
 
 ```text
 CLAUDE_CODE_ARTIFACT=1 claude-muse -p 'Reply with exactly: MUSE WORKS' \
   --no-session-persistence --output-format json
 ```
 
+On Windows, in PowerShell:
+
+```powershell
+$env:CLAUDE_CODE_ARTIFACT = '1'
+claude-muse -p 'Reply with exactly: MUSE WORKS' `
+  --no-session-persistence --output-format json
+Remove-Item Env:\CLAUDE_CODE_ARTIFACT
+```
+
 A 400 reading `Invalid JSON schema` and quoting a regular expression here means
 the adapter is not stripping the patterns Meta cannot compile; fix that rather
 than pinning or downgrading Claude Code, which only moves the failure to the
-next release. On native
+next release.
+
+This check can also pass while testing nothing, and saying which happened is
+part of reporting it. The schema that breaks is behind a server-side feature
+gate: on a machine outside that rollout the tool is still sent, but without the
+argument carrying the bad pattern, so the check goes green without ever
+exercising it. There is no way to force the gate on from the outside. Report
+which case this machine is in:
+
+```text
+node -p "require(require('os').homedir()+'/.claude.json').cachedGrowthBookFeatures.tengu_umber_stile"
+```
+
+`true` means the check exercised the schema. Anything else means it did not,
+and that this machine will begin to whenever the gate reaches it - with no
+update, and no warning. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run

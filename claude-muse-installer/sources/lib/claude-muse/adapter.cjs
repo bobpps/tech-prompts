@@ -297,16 +297,30 @@ function webSearchTools(body) {
 // and changes nothing the model is shown, and the tool still validates its own
 // arguments when the call arrives.
 //
-// `const`, `default`, `enum` and `examples` hold arbitrary JSON rather than
-// subschemas, so a member named `pattern` inside one of them is a value the
-// tool receives, not a constraint, and is left alone.
+// The match is textual on purpose. A pattern that merely spells `\p` in an
+// escaped position loses a constraint it did not have to lose, which widens
+// what the request may carry and never rejects one; reading regex escape state
+// to avoid that would be more machinery than the failure is worth.
+//
+// Which key means what depends on where it sits. `const`, `default`, `enum`
+// and `examples` hold arbitrary JSON rather than subschemas, so a member named
+// `pattern` inside one of them is a value the tool receives and is left alone.
+// But `properties` and `$defs` map a name the tool chose to a subschema, and
+// those names are not keywords: an argument called `default` is a schema and
+// has to be descended into, or its pattern survives and produces the very 400
+// this prevents. The schema maps are listed rather than detected because
+// missing one puts its subschemas back under keyword rules.
+const UNICODE_PROPERTY = /\\[pP]\{/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
+const SCHEMA_MAPS = ['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'];
 
 function portableSchemas(body) {
   for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);
   return body;
 }
 
+// `node` is a subschema, or an array of them. Anything reached from here is
+// read as a schema unless one of the lists above says otherwise.
 function dropUnicodePatterns(node) {
   if (Array.isArray(node)) {
     for (const item of node) dropUnicodePatterns(item);
@@ -315,8 +329,12 @@ function dropUnicodePatterns(node) {
   if (!node || typeof node !== 'object') return;
   for (const [key, value] of Object.entries(node)) {
     if (key === 'pattern' && typeof value === 'string') {
-      if (/\\[pP]\{/.test(value)) delete node[key];
-    } else if (!SCHEMA_VALUES.includes(key)) {
+      if (UNICODE_PROPERTY.test(value)) delete node[key];
+    } else if (SCHEMA_VALUES.includes(key)) {
+      continue;
+    } else if (SCHEMA_MAPS.includes(key)) {
+      if (value && typeof value === 'object') for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+    } else {
       dropUnicodePatterns(value);
     }
   }

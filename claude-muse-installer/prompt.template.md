@@ -483,8 +483,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are forty offline tests in total: twenty-three in `adapter.test.cjs` and
-seventeen in `launcher.test.cjs`. All forty must pass on both platforms;
+There are forty-one offline tests in total: twenty-four in `adapter.test.cjs`
+and seventeen in `launcher.test.cjs`. All forty-one must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -612,17 +612,41 @@ the same prompt-cache path, so it cannot prove the session will work. It also
 sends a different set of tools: the Artifact tool is absent from a print-mode
 run, so a tool schema the provider refuses can end every interactive turn while
 every `-p` check above stays green. Run one more print-mode check with that
-tool forced in, and require the same answer:
+tool forced in, and require the same answer. On POSIX:
 
 ```text
 CLAUDE_CODE_ARTIFACT=1 claude-muse -p 'Reply with exactly: MUSE WORKS' \
   --no-session-persistence --output-format json
 ```
 
+On Windows, in PowerShell:
+
+```powershell
+$env:CLAUDE_CODE_ARTIFACT = '1'
+claude-muse -p 'Reply with exactly: MUSE WORKS' `
+  --no-session-persistence --output-format json
+Remove-Item Env:\CLAUDE_CODE_ARTIFACT
+```
+
 A 400 reading `Invalid JSON schema` and quoting a regular expression here means
 the adapter is not stripping the patterns Meta cannot compile; fix that rather
 than pinning or downgrading Claude Code, which only moves the failure to the
-next release. On native
+next release.
+
+This check can also pass while testing nothing, and saying which happened is
+part of reporting it. The schema that breaks is behind a server-side feature
+gate: on a machine outside that rollout the tool is still sent, but without the
+argument carrying the bad pattern, so the check goes green without ever
+exercising it. There is no way to force the gate on from the outside. Report
+which case this machine is in:
+
+```text
+node -p "require(require('os').homedir()+'/.claude.json').cachedGrowthBookFeatures.tengu_umber_stile"
+```
+
+`true` means the check exercised the schema. Anything else means it did not,
+and that this machine will begin to whenever the gate reaches it - with no
+update, and no warning. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run

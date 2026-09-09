@@ -526,6 +526,35 @@ test('a pattern that is a value rather than a constraint is left alone', () => {
   assert.equal(props.mode.examples[0].pattern, '\\p{L}');
 });
 
+test('a tool argument named like a schema keyword is still a schema', () => {
+  // `properties` and `$defs` map a name the tool chose to a subschema, and that
+  // name is not a JSON Schema keyword. Reading an argument called `default` or
+  // `enum` as the keyword of the same spelling would skip its schema and leave
+  // the pattern in place, which is the 400 this transform exists to prevent.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    $defs: { enum: { type: 'string', pattern: '\\p{Lu}' } },
+    properties: {
+      default: { type: 'string', pattern: '\\p{L}+' },
+      enum: { type: 'string', pattern: '\\p{N}+' },
+      examples: { items: { type: 'string', pattern: '\\p{M}' } },
+      // A property whose own name is a schema-map keyword is no different.
+      properties: { type: 'string', pattern: '\\p{P}' },
+    },
+    // The same spellings one level up really are keywords, and hold values.
+    default: { pattern: '\\p{L}' },
+    enum: [{ pattern: '\\p{N}' }],
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.properties.default.pattern, undefined);
+  assert.equal(schema.properties.enum.pattern, undefined);
+  assert.equal(schema.properties.examples.items.pattern, undefined);
+  assert.equal(schema.properties.properties.pattern, undefined);
+  assert.equal(schema.$defs.enum.pattern, undefined);
+  assert.equal(schema.default.pattern, '\\p{L}');
+  assert.equal(schema.enum[0].pattern, '\\p{N}');
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
