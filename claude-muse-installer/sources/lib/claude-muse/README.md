@@ -26,7 +26,9 @@ and Notion tools can exceed that limit because Claude Code prefixes their names.
 The adapter replaces long names with deterministic, readable hashed aliases
 in tool definitions, tool choices, history, and tool references. It restores
 the original names in JSON and streaming responses before Claude Code sees them.
-Tool inputs, schemas, and text are not rewritten.
+Tool inputs, schemas, and text are not rewritten by the aliasing. One other
+transform reaches into tool schemas, and only to drop a constraint the provider
+cannot compile; see *Regex patterns in tool schemas* below.
 
 ## Web search
 
@@ -44,6 +46,65 @@ your Claude Code settings, or turn the WebSearch tool off.
 
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
+
+## Regex patterns in tool schemas
+
+Meta compiles every JSON Schema `pattern` a tool declares with a strict
+ECMA-262 validator, and refuses the whole request when one of them does not
+parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+property escapes, and in the CLI they sit in a regex literal carrying the `u`
+flag that gives them a meaning. A `pattern` is a bare string and carries no
+flags, so what arrives upstream is a regex the provider cannot compile.
+
+One bad schema among the whole set is enough to end every turn, so the symptom
+is that nothing works at all rather than that one tool is broken. The adapter
+removes any `pattern` containing `\p{` or `\P{` from `tools[].input_schema`,
+and leaves every other pattern in place. Only the constraint goes: `pattern`
+tells the provider what to reject, not the model what to send, so the tool
+description the model reads is unchanged and the tool still validates its own
+arguments when the call arrives.
+
+Dropping a constraint is safe because it widens the schema, and that is a
+property of what surrounds the constraint rather than of the constraint. A few
+keywords take it away. Under `not` the polarity reverses: `{not: {pattern:
+...}}` becomes `{not: {}}`, an empty schema accepts everything, so the
+negation rejects everything. `if` flips which branch applies, widening one
+`oneOf` branch can make two match and fail the whole, `maxContains` turns a
+weaker `contains` into more matches than the cap allows, and a restrictive
+`unevaluatedProperties` or `unevaluatedItems` rejects whatever no keyword
+marked evaluated.
+
+A schema that needs a pattern removed and contains any of those anywhere is
+refused locally with an explanation, the way a web search domain filter is.
+The test is presence, not position, so it also refuses schemas where the
+removal would in fact have been safe. Deciding otherwise means resolving
+`$ref` and tracking which object each keyword governs, which is most of a JSON
+Schema evaluator, and a partial one is exactly what makes a transform look
+correct while it quietly narrows what a tool accepts.
+
+A `patternProperties` key is a regular expression as much as a `pattern` is,
+and the provider compiles it the same way. There the whole entry goes, because
+the key cannot be dropped without it: the names it matched become
+unconstrained, and are still accepted. The exception is a sibling
+`additionalProperties` that would then reject those names, since matching a
+`patternProperties` key is what exempted them. Removing the entry would narrow
+what the tool accepts rather than widen it, so that request is refused too.
+
+Two things make this hard to recognise. The schema is behind a server-side
+feature gate, so the same CLI build fails on one machine and works on another,
+and the set of schemas sent can change with no update at all. And Claude Code
+does not send the Artifact tool on a `-p` run, so a print-mode smoke test
+passes while every interactive session dies. To see the failure on purpose, set
+`CLAUDE_CODE_ARTIFACT=1` on a `-p` run.
+
+If a future schema breaks in a way this transform does not cover, setting
+`CLAUDE_CODE_ARTIFACT_DB_STR_REPLACE` to any value at all turns the offending
+operation off without touching the adapter. It reads as a disable whatever it
+is set to, including `true`, because the CLI compares the variable against the
+boolean `true` and an environment variable is always a string. This is a
+stopgap: it gives up a working feature to route around one bad pattern, and the
+transform above is what closes the class.
 
 ## Auto mode
 

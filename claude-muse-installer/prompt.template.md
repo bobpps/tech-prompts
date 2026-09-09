@@ -215,7 +215,43 @@ First inspect the environment:
    non-empty `MUSE_AUTH_TOKEN`. Before replacing any other existing target,
    make a timestamped backup under `~/.local/lib/claude-muse/backups/`, readable
    only by the current user where the platform allows it. Never display the
-   secret while doing so.
+   secret while doing so. An installation that is already there is an update
+   rather than a fresh install; follow the procedure directly below.
+
+Updating an existing installation:
+
+This prompt is also the update procedure. The blocks below are the current
+contents of every installed file, so an installation that predates them is
+brought forward by reconciling each file against its block. Nothing here
+reaches the network or a repository, and there is no version to compare: the
+blocks are authoritative, and an installed file that differs from its block is
+either older than this prompt or locally modified. Both are resolved the same
+way.
+
+If `~/.local/lib/claude-muse` already exists, do this before writing anything:
+
+- Compare each target file for this platform against its block by content, not
+  by eye, and report which ones differ before changing any of them.
+- Three files are deliberately not literal copies of their blocks. Comparing
+  them naively reports a difference that is not one:
+  - `~/.config/claude-muse/provider.env` carries the key. Keep an existing
+    non-empty `MUSE_AUTH_TOKEN` line unchanged and reconcile only the other
+    settings. Never print the key while comparing.
+  - `~/.local/bin/claude-muse.cmd` is installed with CRLF line endings.
+    Compare it with line endings normalised.
+  - `~/.local/bin/claude-muse` has its last line rewritten under Git Bash where
+    `$HOME` and `os.homedir()` disagree. Leave that rewrite in place, and
+    re-apply it if you replace the file.
+- Replace only the files that differ, backing each one up first as step 7 says.
+  Leave earlier backups alone.
+- Then run the offline tests and every live check below again, in full. An
+  update is not finished when the files are written. The adapter is the layer
+  that absorbs provider incompatibilities, so a changed adapter is exactly the
+  thing that can turn a working installation into one that fails on every turn,
+  and only a real session proves that it did not.
+
+Report which files you replaced, which you left unchanged, and where the
+backups went.
 
 Permissions differ by platform, and this is the one place where the two
 installations are not equivalent.
@@ -447,8 +483,9 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-seven offline tests in total: twenty in `adapter.test.cjs` and
-seventeen in `launcher.test.cjs`. All thirty-seven must pass on both platforms;
+There are forty-eight offline tests in total: thirty-one in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-eight must
+pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -572,7 +609,48 @@ repository. Clean up only the exact temporary directory created for this test.
 
 On every platform, confirm by hand that an interactive `claude-muse` session
 starts, sends one real message and gets an answer. A `-p` run does not exercise
-the same prompt-cache path, so it cannot prove the session will work. On native
+the same prompt-cache path, so it cannot prove the session will work. It also
+sends a different set of tools: the Artifact tool is absent from a print-mode
+run, so a tool schema the provider refuses can end every interactive turn while
+every `-p` check above stays green. Run one more print-mode check with that
+tool forced in, and require the same answer. On POSIX:
+
+```text
+CLAUDE_CODE_ARTIFACT=1 claude-muse -p 'Reply with exactly: MUSE WORKS' \
+  --no-session-persistence --output-format json
+```
+
+On Windows, in PowerShell:
+
+```powershell
+$env:CLAUDE_CODE_ARTIFACT = '1'
+claude-muse -p 'Reply with exactly: MUSE WORKS' `
+  --no-session-persistence --output-format json
+Remove-Item Env:\CLAUDE_CODE_ARTIFACT
+```
+
+A 400 reading `Invalid JSON schema` and quoting a regular expression here means
+the adapter is not stripping the patterns Meta cannot compile; fix that rather
+than pinning or downgrading Claude Code, which only moves the failure to the
+next release.
+
+This check can also pass while testing nothing, and saying which happened is
+part of reporting it. The schema that breaks is behind a server-side feature
+gate: on a machine outside that rollout the tool is still sent, but without the
+argument carrying the bad pattern, so the check goes green without ever
+exercising it. There is no way to force the gate on from the outside. Report
+which case this machine is in:
+
+```text
+node -p "require(require('os').homedir()+'/.claude.json').cachedGrowthBookFeatures?.tengu_umber_stile ?? 'absent'"
+```
+
+`true` means the check exercised the schema. Anything else means it did not,
+and that this machine will begin to whenever the gate reaches it - with no
+update, and no warning. `absent` is one of those answers rather than a broken
+command: the gate cache is written when Claude Code can reach the service, so
+a machine that has not been told yet is one the schema has not reached
+either. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run

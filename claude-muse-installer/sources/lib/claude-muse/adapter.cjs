@@ -211,6 +211,10 @@ class ToolNames {
 // whole body would silently reduce an MCP schema property of that name to
 // `{"type": ...}`, dropping its own `properties` and `description` on the way
 // through, and the tool would then be described wrongly to the model.
+//
+// `portableSchemas` below is the one transform that does reach into
+// `input_schema`, and it removes a single unusable constraint rather than
+// rewriting anything. Nothing else in this file reads a tool's own data.
 // FORCE_PROMPT_CACHING_5M pins the provider default at the source, and with
 // that variable set a direct connection never produced the 400 this guards
 // against, so on a good day nothing here fires. It stays anyway. That variable
@@ -273,6 +277,193 @@ function webSearchTools(body) {
     for (const field of Object.keys(tool)) if (!WEB_SEARCH_KEEP.includes(field)) delete tool[field];
   }
   return body;
+}
+
+// Meta compiles every JSON Schema `pattern` a tool declares with a strict
+// ECMA-262 validator, and refuses the whole request when one of them does not
+// parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+// constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+// property escapes, and in the CLI they sit in a regex literal carrying the
+// `u` flag that gives them a meaning. A `pattern` is a bare string and carries
+// no flags, so what arrives upstream is a regex the provider cannot compile.
+//
+// One bad schema among the whole set kills every call in the session, so the
+// visible symptom is that the model is unavailable rather than that one tool is
+// broken. The schema is also behind a server-side feature gate, which is why
+// the same CLI build fails on one machine and works on another, and why the
+// set of schemas sent can change without an update. Matching the class - a
+// Unicode property escape anywhere in a pattern - rather than this one regex
+// is what keeps the next gated schema from reopening this.
+//
+// Only the constraint is removed, never the property it constrained. `pattern`
+// tells the provider what to reject; it is not part of what the model reads to
+// decide how to call the tool. Dropping it widens what the request may carry
+// and changes nothing the model is shown, and the tool still validates its own
+// arguments when the call arrives.
+//
+// That widening is what makes dropping safe, and it is a property of the
+// schema around the constraint rather than of the constraint. A handful of
+// keywords take it away, and none of them can be judged from where the pattern
+// sits. Under `not` the polarity reverses - `{not: {pattern: ...}}` becomes
+// `{not: {}}`, and the empty schema accepts everything, so the negation
+// rejects everything. `if` flips which branch applies, widening one `oneOf`
+// branch can make two match and fail the whole, and `maxContains` turns a
+// weaker `contains` into more matches than the cap allows. A restrictive
+// `unevaluatedProperties` or `unevaluatedItems` rejects whatever no keyword
+// marked evaluated, and matching a `patternProperties` key is what marked it.
+//
+// So this does not try to decide it. A schema that needs a pattern removed and
+// contains any of those keywords anywhere is refused with an explanation, the
+// way a web_search domain filter is. A `$ref` is not on the list: a reference
+// can only reach a non-monotonic position through one of those keywords, and
+// the schema is already refused if it has one.
+//
+// Deciding by presence over-refuses - an `unevaluatedProperties` governing one
+// object says nothing about a nested one - and that is taken deliberately. The
+// alternative is modelling instance locations and resolving references, which
+// is most of a JSON Schema evaluator; a partial model of one is exactly what
+// makes a transform look correct while it quietly narrows what a tool accepts.
+//
+// The match is textual on purpose. A pattern that merely spells `\p` in an
+// escaped position loses a constraint it did not have to lose, which widens
+// what the request may carry and never rejects one; reading regex escape state
+// to avoid that would be more machinery than the failure is worth.
+//
+// Which key means what depends on where it sits. `const`, `default`, `enum`,
+// `example` and `examples` hold arbitrary JSON rather than subschemas, so a
+// member named `pattern` inside one of them is a value the tool receives and
+// is left alone, as is anything under the conventional `x-` extension space.
+// But `properties` and `$defs` map a name the tool chose to a subschema, and
+// those names are not keywords: an argument called `default` is a schema and
+// has to be descended into, or its pattern survives and produces the very 400
+// this prevents.
+//
+// The maps are listed rather than detected, because missing one puts its
+// subschemas back under keyword rules. This is every keyword across draft-07,
+// 2019-09 and 2020-12 whose value is keyed by a name the tool chose;
+// `dependencies` is in it for its draft-07 subschema form, and its other form,
+// a list of required property names, is walked harmlessly. `dependentRequired`
+// is absent because it only ever holds those lists.
+//
+// A keyword in neither list is walked as a schema. JSON Schema lets a tool add
+// keywords of its own, so this cannot be decided from a list of the ones that
+// carry subschemas: such a list has to be complete to be safe, and `items`,
+// `contains`, `propertyNames`, `contentSchema` and the rest are only the ones
+// that exist today. Guessing wrong towards a schema costs a constraint the
+// provider would have enforced and never a request - the widening check above
+// is what keeps that true - while guessing wrong the other way leaves a
+// pattern it refuses, and every turn in the session ends. Only the second is
+// worth avoiding, which is why the unknown case defaults to a schema and the
+// exceptions are named instead.
+const UNICODE_PROPERTY = /\\[pP]\{/;
+const SCHEMA_VALUES = ['const', 'default', 'enum', 'example', 'examples'];
+const EXTENSION_KEY = /^x-/;
+const ENTANGLED_ALWAYS = ['not', 'if', 'oneOf', 'maxContains'];
+const ENTANGLED_WHEN_CLOSED = ['unevaluatedProperties', 'unevaluatedItems'];
+
+// Absent or `true` leaves the object open; anything else can reject a name.
+function restrictive(value) {
+  return value !== undefined && value !== true;
+}
+const SCHEMA_MAPS = [
+  'properties', 'patternProperties', '$defs', 'definitions', 'dependencies', 'dependentSchemas',
+];
+
+function portableSchemas(body) {
+  for (const tool of (body && body.tools) || []) {
+    const found = unicodeRegex(tool.input_schema);
+    if (!found) continue;
+    const entangled = entangling(tool.input_schema);
+    if (entangled) {
+      throw new UnsupportedRequest(
+        'A tool schema uses ' + found + ', which Meta cannot compile, in a schema that also ' +
+        'uses ' + entangled + '. Removing the expression widens an ordinary schema, but next ' +
+        'to that keyword it can narrow one instead and reject arguments the tool declares ' +
+        'valid. Remove the Unicode property escape from that tool schema, or turn the tool off.'
+      );
+    }
+    dropUnicodePatterns(tool.input_schema);
+  }
+  return body;
+}
+
+// Visits every subschema, in the positions where these keywords mean what they
+// say. `visit` returns a truthy value to stop the walk and hand it back.
+function eachSchema(node, visit) {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = eachSchema(item, visit);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!node || typeof node !== 'object') return null;
+  const found = visit(node);
+  if (found) return found;
+  for (const [key, value] of Object.entries(node)) {
+    if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) continue;
+    if (SCHEMA_MAPS.includes(key)) {
+      if (value && typeof value === 'object') {
+        for (const sub of Object.values(value)) {
+          const deeper = eachSchema(sub, visit);
+          if (deeper) return deeper;
+        }
+      }
+    } else {
+      const deeper = eachSchema(value, visit);
+      if (deeper) return deeper;
+    }
+  }
+  return null;
+}
+
+// The expression that would be removed, or null if there is nothing to do. A
+// `patternProperties` key is a regular expression as much as a `pattern` is,
+// and the provider compiles it the same way, so a schema can be refused for a
+// key alone. Only this map is keyed by a regex; `properties`, `$defs` and the
+// rest are keyed by names.
+function unicodeRegex(schema) {
+  return eachSchema(schema, node => {
+    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) return node.pattern;
+    const map = node.patternProperties;
+    if (!map || typeof map !== 'object') return null;
+    return Object.keys(map).find(key => UNICODE_PROPERTY.test(key)) || null;
+  });
+}
+
+// The first keyword that makes removal something other than a widening, or
+// null. Read the block above `portableSchemas` for what each of them does.
+function entangling(schema) {
+  return eachSchema(schema, node => {
+    for (const key of ENTANGLED_ALWAYS) if (node[key] !== undefined) return key;
+    for (const key of ENTANGLED_WHEN_CLOSED) if (restrictive(node[key])) return key;
+    return null;
+  });
+}
+
+// Reached only for a schema already known to be free of those keywords, so
+// every removal here widens. The one remaining local question is a
+// `patternProperties` entry: dropping it leaves the names it matched
+// unconstrained and still accepted, unless a sibling `additionalProperties`
+// would now reject them, because matching the key is what exempted them.
+function dropUnicodePatterns(schema) {
+  eachSchema(schema, node => {
+    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) delete node.pattern;
+    const map = node.patternProperties;
+    if (!map || typeof map !== 'object') return null;
+    for (const key of Object.keys(map)) {
+      if (!UNICODE_PROPERTY.test(key)) continue;
+      if (restrictive(node.additionalProperties)) {
+        throw new UnsupportedRequest(
+          'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
+          'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
+          'property escape from that tool schema, or turn the tool off.'
+        );
+      }
+      delete map[key];
+    }
+    return null;
+  });
 }
 
 // Meta rejects `stop_sequences` outright with HTTP 400.
@@ -425,7 +616,7 @@ async function startProxy(upstream, token, idleSeconds) {
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
         });
-        payload = JSON.stringify(stopSequences(plainCacheControl(webSearchTools(names.request(parsed)))));
+        payload = JSON.stringify(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed))))));
       }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
@@ -504,4 +695,4 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };

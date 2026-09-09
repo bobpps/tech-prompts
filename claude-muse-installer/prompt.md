@@ -215,7 +215,43 @@ First inspect the environment:
    non-empty `MUSE_AUTH_TOKEN`. Before replacing any other existing target,
    make a timestamped backup under `~/.local/lib/claude-muse/backups/`, readable
    only by the current user where the platform allows it. Never display the
-   secret while doing so.
+   secret while doing so. An installation that is already there is an update
+   rather than a fresh install; follow the procedure directly below.
+
+Updating an existing installation:
+
+This prompt is also the update procedure. The blocks below are the current
+contents of every installed file, so an installation that predates them is
+brought forward by reconciling each file against its block. Nothing here
+reaches the network or a repository, and there is no version to compare: the
+blocks are authoritative, and an installed file that differs from its block is
+either older than this prompt or locally modified. Both are resolved the same
+way.
+
+If `~/.local/lib/claude-muse` already exists, do this before writing anything:
+
+- Compare each target file for this platform against its block by content, not
+  by eye, and report which ones differ before changing any of them.
+- Three files are deliberately not literal copies of their blocks. Comparing
+  them naively reports a difference that is not one:
+  - `~/.config/claude-muse/provider.env` carries the key. Keep an existing
+    non-empty `MUSE_AUTH_TOKEN` line unchanged and reconcile only the other
+    settings. Never print the key while comparing.
+  - `~/.local/bin/claude-muse.cmd` is installed with CRLF line endings.
+    Compare it with line endings normalised.
+  - `~/.local/bin/claude-muse` has its last line rewritten under Git Bash where
+    `$HOME` and `os.homedir()` disagree. Leave that rewrite in place, and
+    re-apply it if you replace the file.
+- Replace only the files that differ, backing each one up first as step 7 says.
+  Leave earlier backups alone.
+- Then run the offline tests and every live check below again, in full. An
+  update is not finished when the files are written. The adapter is the layer
+  that absorbs provider incompatibilities, so a changed adapter is exactly the
+  thing that can turn a working installation into one that fails on every turn,
+  and only a real session proves that it did not.
+
+Report which files you replaced, which you left unchanged, and where the
+backups went.
 
 Permissions differ by platform, and this is the one place where the two
 installations are not equivalent.
@@ -975,6 +1011,10 @@ class ToolNames {
 // whole body would silently reduce an MCP schema property of that name to
 // `{"type": ...}`, dropping its own `properties` and `description` on the way
 // through, and the tool would then be described wrongly to the model.
+//
+// `portableSchemas` below is the one transform that does reach into
+// `input_schema`, and it removes a single unusable constraint rather than
+// rewriting anything. Nothing else in this file reads a tool's own data.
 // FORCE_PROMPT_CACHING_5M pins the provider default at the source, and with
 // that variable set a direct connection never produced the 400 this guards
 // against, so on a good day nothing here fires. It stays anyway. That variable
@@ -1037,6 +1077,193 @@ function webSearchTools(body) {
     for (const field of Object.keys(tool)) if (!WEB_SEARCH_KEEP.includes(field)) delete tool[field];
   }
   return body;
+}
+
+// Meta compiles every JSON Schema `pattern` a tool declares with a strict
+// ECMA-262 validator, and refuses the whole request when one of them does not
+// parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+// constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+// property escapes, and in the CLI they sit in a regex literal carrying the
+// `u` flag that gives them a meaning. A `pattern` is a bare string and carries
+// no flags, so what arrives upstream is a regex the provider cannot compile.
+//
+// One bad schema among the whole set kills every call in the session, so the
+// visible symptom is that the model is unavailable rather than that one tool is
+// broken. The schema is also behind a server-side feature gate, which is why
+// the same CLI build fails on one machine and works on another, and why the
+// set of schemas sent can change without an update. Matching the class - a
+// Unicode property escape anywhere in a pattern - rather than this one regex
+// is what keeps the next gated schema from reopening this.
+//
+// Only the constraint is removed, never the property it constrained. `pattern`
+// tells the provider what to reject; it is not part of what the model reads to
+// decide how to call the tool. Dropping it widens what the request may carry
+// and changes nothing the model is shown, and the tool still validates its own
+// arguments when the call arrives.
+//
+// That widening is what makes dropping safe, and it is a property of the
+// schema around the constraint rather than of the constraint. A handful of
+// keywords take it away, and none of them can be judged from where the pattern
+// sits. Under `not` the polarity reverses - `{not: {pattern: ...}}` becomes
+// `{not: {}}`, and the empty schema accepts everything, so the negation
+// rejects everything. `if` flips which branch applies, widening one `oneOf`
+// branch can make two match and fail the whole, and `maxContains` turns a
+// weaker `contains` into more matches than the cap allows. A restrictive
+// `unevaluatedProperties` or `unevaluatedItems` rejects whatever no keyword
+// marked evaluated, and matching a `patternProperties` key is what marked it.
+//
+// So this does not try to decide it. A schema that needs a pattern removed and
+// contains any of those keywords anywhere is refused with an explanation, the
+// way a web_search domain filter is. A `$ref` is not on the list: a reference
+// can only reach a non-monotonic position through one of those keywords, and
+// the schema is already refused if it has one.
+//
+// Deciding by presence over-refuses - an `unevaluatedProperties` governing one
+// object says nothing about a nested one - and that is taken deliberately. The
+// alternative is modelling instance locations and resolving references, which
+// is most of a JSON Schema evaluator; a partial model of one is exactly what
+// makes a transform look correct while it quietly narrows what a tool accepts.
+//
+// The match is textual on purpose. A pattern that merely spells `\p` in an
+// escaped position loses a constraint it did not have to lose, which widens
+// what the request may carry and never rejects one; reading regex escape state
+// to avoid that would be more machinery than the failure is worth.
+//
+// Which key means what depends on where it sits. `const`, `default`, `enum`,
+// `example` and `examples` hold arbitrary JSON rather than subschemas, so a
+// member named `pattern` inside one of them is a value the tool receives and
+// is left alone, as is anything under the conventional `x-` extension space.
+// But `properties` and `$defs` map a name the tool chose to a subschema, and
+// those names are not keywords: an argument called `default` is a schema and
+// has to be descended into, or its pattern survives and produces the very 400
+// this prevents.
+//
+// The maps are listed rather than detected, because missing one puts its
+// subschemas back under keyword rules. This is every keyword across draft-07,
+// 2019-09 and 2020-12 whose value is keyed by a name the tool chose;
+// `dependencies` is in it for its draft-07 subschema form, and its other form,
+// a list of required property names, is walked harmlessly. `dependentRequired`
+// is absent because it only ever holds those lists.
+//
+// A keyword in neither list is walked as a schema. JSON Schema lets a tool add
+// keywords of its own, so this cannot be decided from a list of the ones that
+// carry subschemas: such a list has to be complete to be safe, and `items`,
+// `contains`, `propertyNames`, `contentSchema` and the rest are only the ones
+// that exist today. Guessing wrong towards a schema costs a constraint the
+// provider would have enforced and never a request - the widening check above
+// is what keeps that true - while guessing wrong the other way leaves a
+// pattern it refuses, and every turn in the session ends. Only the second is
+// worth avoiding, which is why the unknown case defaults to a schema and the
+// exceptions are named instead.
+const UNICODE_PROPERTY = /\\[pP]\{/;
+const SCHEMA_VALUES = ['const', 'default', 'enum', 'example', 'examples'];
+const EXTENSION_KEY = /^x-/;
+const ENTANGLED_ALWAYS = ['not', 'if', 'oneOf', 'maxContains'];
+const ENTANGLED_WHEN_CLOSED = ['unevaluatedProperties', 'unevaluatedItems'];
+
+// Absent or `true` leaves the object open; anything else can reject a name.
+function restrictive(value) {
+  return value !== undefined && value !== true;
+}
+const SCHEMA_MAPS = [
+  'properties', 'patternProperties', '$defs', 'definitions', 'dependencies', 'dependentSchemas',
+];
+
+function portableSchemas(body) {
+  for (const tool of (body && body.tools) || []) {
+    const found = unicodeRegex(tool.input_schema);
+    if (!found) continue;
+    const entangled = entangling(tool.input_schema);
+    if (entangled) {
+      throw new UnsupportedRequest(
+        'A tool schema uses ' + found + ', which Meta cannot compile, in a schema that also ' +
+        'uses ' + entangled + '. Removing the expression widens an ordinary schema, but next ' +
+        'to that keyword it can narrow one instead and reject arguments the tool declares ' +
+        'valid. Remove the Unicode property escape from that tool schema, or turn the tool off.'
+      );
+    }
+    dropUnicodePatterns(tool.input_schema);
+  }
+  return body;
+}
+
+// Visits every subschema, in the positions where these keywords mean what they
+// say. `visit` returns a truthy value to stop the walk and hand it back.
+function eachSchema(node, visit) {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = eachSchema(item, visit);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!node || typeof node !== 'object') return null;
+  const found = visit(node);
+  if (found) return found;
+  for (const [key, value] of Object.entries(node)) {
+    if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) continue;
+    if (SCHEMA_MAPS.includes(key)) {
+      if (value && typeof value === 'object') {
+        for (const sub of Object.values(value)) {
+          const deeper = eachSchema(sub, visit);
+          if (deeper) return deeper;
+        }
+      }
+    } else {
+      const deeper = eachSchema(value, visit);
+      if (deeper) return deeper;
+    }
+  }
+  return null;
+}
+
+// The expression that would be removed, or null if there is nothing to do. A
+// `patternProperties` key is a regular expression as much as a `pattern` is,
+// and the provider compiles it the same way, so a schema can be refused for a
+// key alone. Only this map is keyed by a regex; `properties`, `$defs` and the
+// rest are keyed by names.
+function unicodeRegex(schema) {
+  return eachSchema(schema, node => {
+    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) return node.pattern;
+    const map = node.patternProperties;
+    if (!map || typeof map !== 'object') return null;
+    return Object.keys(map).find(key => UNICODE_PROPERTY.test(key)) || null;
+  });
+}
+
+// The first keyword that makes removal something other than a widening, or
+// null. Read the block above `portableSchemas` for what each of them does.
+function entangling(schema) {
+  return eachSchema(schema, node => {
+    for (const key of ENTANGLED_ALWAYS) if (node[key] !== undefined) return key;
+    for (const key of ENTANGLED_WHEN_CLOSED) if (restrictive(node[key])) return key;
+    return null;
+  });
+}
+
+// Reached only for a schema already known to be free of those keywords, so
+// every removal here widens. The one remaining local question is a
+// `patternProperties` entry: dropping it leaves the names it matched
+// unconstrained and still accepted, unless a sibling `additionalProperties`
+// would now reject them, because matching the key is what exempted them.
+function dropUnicodePatterns(schema) {
+  eachSchema(schema, node => {
+    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) delete node.pattern;
+    const map = node.patternProperties;
+    if (!map || typeof map !== 'object') return null;
+    for (const key of Object.keys(map)) {
+      if (!UNICODE_PROPERTY.test(key)) continue;
+      if (restrictive(node.additionalProperties)) {
+        throw new UnsupportedRequest(
+          'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
+          'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
+          'property escape from that tool schema, or turn the tool off.'
+        );
+      }
+      delete map[key];
+    }
+    return null;
+  });
 }
 
 // Meta rejects `stop_sequences` outright with HTTP 400.
@@ -1189,7 +1416,7 @@ async function startProxy(upstream, token, idleSeconds) {
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
         });
-        payload = JSON.stringify(stopSequences(plainCacheControl(webSearchTools(names.request(parsed)))));
+        payload = JSON.stringify(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed))))));
       }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
@@ -1268,7 +1495,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -1640,7 +1867,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -2104,6 +2331,262 @@ test('web_search keeps only the fields Meta accepts; domain filters are refused'
   }
 });
 
+test('a Unicode-property pattern is dropped from a tool schema, and nothing else is', () => {
+  // The pattern Claude Code 2.1.266 puts on Artifact's `field` argument, taken
+  // off the wire. In the CLI it is a regex literal carrying the `u` flag that
+  // gives \p{Cc} its meaning; a JSON Schema `pattern` is a bare string with no
+  // flags, so what reaches the provider is a regex it refuses to compile.
+  const artifact = '^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}"\\\\./[\\]]{1,200}$';
+  const plain = '^[a-z0-9_-]+$';
+  const body = portableSchemas({
+    tools: [
+      { name: 'Artifact', input_schema: { type: 'object', $defs: { id: { type: 'string', pattern: '^\\p{Nd}{4}$' } }, properties: {
+        field: { type: 'string', description: 'kept', pattern: artifact },
+        collection: { type: 'string', pattern: plain },
+        doc: { anyOf: [{ type: 'string', pattern: '\\p{L}+' }, { type: 'string', pattern: plain }] },
+        rows: { items: { type: 'string', pattern: '\\P{N}' } },
+      } } },
+      { name: 'Read' },
+      { type: 'web_search_20250305', name: 'web_search' },
+    ],
+    messages: [{ content: [{ type: 'tool_use', name: 'Artifact', input: { pattern: '\\p{L}' } }] }],
+  });
+  const schema = body.tools[0].input_schema;
+  assert.ok(!('pattern' in schema.properties.field));
+  assert.equal(schema.properties.doc.anyOf[0].pattern, undefined);
+  assert.equal(schema.properties.rows.items.pattern, undefined);
+  assert.equal(schema.$defs.id.pattern, undefined);
+  // A pattern the provider can compile is a useful constraint and stays.
+  assert.equal(schema.properties.collection.pattern, plain);
+  assert.equal(schema.properties.doc.anyOf[1].pattern, plain);
+  // Only the constraint goes. The property it constrained, and everything the
+  // model reads to decide how to call the tool, are left exactly as they were.
+  assert.equal(schema.properties.field.type, 'string');
+  assert.equal(schema.properties.field.description, 'kept');
+  // Tool definitions only. A past call's arguments are the conversation, and a
+  // tool is free to take an argument of its own called `pattern`.
+  assert.equal(body.messages[0].content[0].input.pattern, '\\p{L}');
+});
+
+test('a pattern that is a value rather than a constraint is left alone', () => {
+  // `const`, `default`, `enum` and `examples` hold arbitrary JSON, not
+  // subschemas. An object inside one of them may have a member named `pattern`,
+  // and deleting it would change a value the tool receives instead of a
+  // constraint the provider enforces.
+  const body = portableSchemas({ tools: [{ name: 'Grep', input_schema: {
+    type: 'object',
+    properties: {
+      rule: { type: 'object', default: { pattern: '\\p{L}+' }, const: { pattern: '\\p{M}' } },
+      mode: { enum: [{ pattern: '\\p{N}' }], examples: [{ pattern: '\\p{L}' }] },
+    },
+  } }] });
+  const props = body.tools[0].input_schema.properties;
+  assert.equal(props.rule.default.pattern, '\\p{L}+');
+  assert.equal(props.rule.const.pattern, '\\p{M}');
+  assert.equal(props.mode.enum[0].pattern, '\\p{N}');
+  assert.equal(props.mode.examples[0].pattern, '\\p{L}');
+});
+
+test('a tool argument named like a schema keyword is still a schema', () => {
+  // `properties` and `$defs` map a name the tool chose to a subschema, and that
+  // name is not a JSON Schema keyword. Reading an argument called `default` or
+  // `enum` as the keyword of the same spelling would skip its schema and leave
+  // the pattern in place, which is the 400 this transform exists to prevent.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    $defs: { enum: { type: 'string', pattern: '\\p{Lu}' } },
+    // draft-07 `dependencies` keys by property name too, and its values are a
+    // subschema or a list of required property names.
+    dependencies: { default: { properties: { x: { type: 'string', pattern: '\\p{S}' } } }, ok: ['y'] },
+    properties: {
+      default: { type: 'string', pattern: '\\p{L}+' },
+      enum: { type: 'string', pattern: '\\p{N}+' },
+      examples: { items: { type: 'string', pattern: '\\p{M}' } },
+      // A property whose own name is a schema-map keyword is no different.
+      properties: { type: 'string', pattern: '\\p{P}' },
+    },
+    // The same spellings one level up really are keywords, and hold values.
+    default: { pattern: '\\p{L}' },
+    enum: [{ pattern: '\\p{N}' }],
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.properties.default.pattern, undefined);
+  assert.equal(schema.properties.enum.pattern, undefined);
+  assert.equal(schema.properties.examples.items.pattern, undefined);
+  assert.equal(schema.properties.properties.pattern, undefined);
+  assert.equal(schema.$defs.enum.pattern, undefined);
+  assert.equal(schema.dependencies.default.properties.x.pattern, undefined);
+  assert.deepEqual(schema.dependencies.ok, ['y']);
+  assert.equal(schema.default.pattern, '\\p{L}');
+  assert.equal(schema.enum[0].pattern, '\\p{N}');
+});
+
+test('an unknown keyword is read as a schema; a named annotation is not', () => {
+  // A keyword this walker has never heard of is walked as a schema. Guessing
+  // wrong that way drops a constraint the provider was going to enforce and
+  // widens what the request may carry; guessing wrong the other way leaves a
+  // pattern the provider refuses, which ends every turn in the session. Only
+  // the second is worth avoiding, so the unknown case is not left to a list of
+  // schema-bearing keywords that would have to be complete to be safe.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    // Values, by name and by the `x-` extension space. Left alone.
+    example: { pattern: '\\p{L}+' },
+    'x-vendor': { metadata: { pattern: '\\p{N}+' } },
+    properties: {
+      // `contentSchema` really is a subschema keyword, and this walker does
+      // not list it. The catch-all is what keeps that from mattering.
+      doc: { type: 'string', contentSchema: { type: 'string', pattern: '\\p{M}' } },
+    },
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.example.pattern, '\\p{L}+');
+  assert.equal(schema['x-vendor'].metadata.pattern, '\\p{N}+');
+  assert.equal(schema.properties.doc.contentSchema.pattern, undefined);
+});
+
+test('a patternProperties key is a regex too, and is dropped or refused', () => {
+  // The key of a `patternProperties` entry is itself a regular expression the
+  // provider compiles, so the same escapes are fatal there and walking only
+  // the values would leave the request refused for the same reason.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    patternProperties: {
+      '^\\p{L}+$': { type: 'string', pattern: '\\p{N}' },
+      '^[a-z]+$': { type: 'string', pattern: '\\p{M}' },
+    },
+  } }] });
+  const map = body.tools[0].input_schema.patternProperties;
+  // The entry goes with its key: what it constrained becomes unconstrained,
+  // which is a widening, and the properties it matched are still accepted.
+  assert.deepEqual(Object.keys(map), ['^[a-z]+$']);
+  // The surviving entry is still a schema and is still cleaned.
+  assert.equal(map['^[a-z]+$'].pattern, undefined);
+  assert.equal(map['^[a-z]+$'].type, 'string');
+});
+
+test('a patternProperties key cannot be dropped where additionalProperties would reject it', () => {
+  // Removing the entry stops exempting the names it matched, so a restrictive
+  // `additionalProperties` turns the widening into a narrowing: arguments the
+  // tool declared valid would start being rejected. That is a change to what
+  // the tool accepts, and it is not the adapter's to make silently.
+  for (const additional of [false, { type: 'string' }]) {
+    assert.throws(
+      () => portableSchemas({ tools: [{ name: 'X', input_schema: {
+        type: 'object',
+        additionalProperties: additional,
+        patternProperties: { '^\\p{L}+$': { type: 'string' } },
+      } }] }),
+      error => error instanceof UnsupportedRequest && error.message.includes('\\p{L}')
+    );
+  }
+  // An open schema is the ordinary case and is widened rather than refused.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    additionalProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
+test('a pattern under an applicator that inverts is refused, not dropped', () => {
+  // Dropping a constraint widens the schema it sits in, and that is what makes
+  // dropping safe - but only where the schema around it is monotonic. Under
+  // `not` the polarity reverses: `{not: {pattern: ...}}` becomes `{not: {}}`,
+  // and the empty schema accepts everything, so the negation rejects
+  // everything. `if` flips which branch applies, and widening one `oneOf`
+  // branch can make two match and fail the whole. Those cannot be widened, so
+  // they are refused with an explanation rather than silently narrowed.
+  const under = shape => ({ tools: [{ name: 'X', input_schema: { type: 'object', properties: { s: shape } } }] });
+  for (const shape of [
+    { not: { pattern: '\\p{L}+' } },
+    { if: { pattern: '\\p{L}+' }, then: { minLength: 2 } },
+    { oneOf: [{ pattern: '\\p{L}+' }, { type: 'number' }] },
+    // Depth does not restore the guarantee: still inside the negation.
+    { not: { properties: { t: { items: { pattern: '\\p{L}+' } } } } },
+  ]) {
+    assert.throws(
+      () => portableSchemas(under(shape)),
+      error => error instanceof UnsupportedRequest && /not|if|oneOf/.test(error.message)
+    );
+  }
+});
+
+test('the applicators that preserve widening still drop', () => {
+  // `allOf`, `anyOf`, `contains` and `propertyNames` all get weaker when a
+  // subschema does, so the guarantee holds under them and the pattern goes.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    allOf: [{ pattern: '\\p{L}' }],
+    anyOf: [{ pattern: '\\p{N}' }],
+    contains: { pattern: '\\p{M}' },
+    propertyNames: { pattern: '\\p{P}' },
+    $defs: { named: { pattern: '\\p{S}' } },
+  } }] });
+  const s = body.tools[0].input_schema;
+  for (const at of [s.allOf[0], s.anyOf[0], s.contains, s.propertyNames, s.$defs.named]) {
+    assert.equal(at.pattern, undefined);
+  }
+});
+
+test('a keyword that removes the guarantee refuses the whole schema', () => {
+  // The check is presence, not position. A schema carrying one of these
+  // keywords anywhere is refused even where the pattern itself sits somewhere
+  // that would have been safe, because deciding otherwise means resolving
+  // references and tracking instance locations - most of a schema evaluator,
+  // and a partial one is what lets a transform narrow a schema quietly.
+  const refused = schema => assert.throws(
+    () => portableSchemas({ tools: [{ name: 'X', input_schema: schema }] }),
+    error => error instanceof UnsupportedRequest
+  );
+  // A definition cleaned where it is stored, applied under a negation.
+  refused({ $defs: { bad: { pattern: '\\p{L}+' } }, not: { $ref: '#/$defs/bad' } });
+  // `maxContains`: a weaker `contains` matches more elements than the cap.
+  refused({ type: 'array', contains: { pattern: '\\p{N}+' }, maxContains: 1 });
+  // The pattern is in a plainly monotonic place; the `if` elsewhere is enough.
+  refused({ type: 'object', if: { type: 'string' }, properties: { s: { pattern: '\\p{L}' } } });
+  // With nothing to remove, none of these keywords matter at all.
+  const untouched = { type: 'object', not: { pattern: '^[a-z]+$' }, maxContains: 1 };
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'X', input_schema: untouched }] }).tools[0].input_schema, untouched);
+});
+
+test('a patternProperties entry sealed by unevaluatedProperties is refused', () => {
+  // `unevaluatedProperties: false` rejects what no keyword marked evaluated,
+  // and matching a `patternProperties` key is what marked those names. Delete
+  // the entry and they become unevaluated, so the schema narrows exactly as it
+  // does under a restrictive `additionalProperties`. Only a restrictive one
+  // counts: `true` rejects nothing and leaves the removal a widening.
+  const sealed = { tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: false,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] };
+  assert.throws(() => portableSchemas(sealed), error => error instanceof UnsupportedRequest);
+
+  const enclosing = { tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: false,
+    allOf: [{ patternProperties: { '^\\p{L}+$': { type: 'string' } } }],
+  } }] };
+  assert.throws(() => portableSchemas(enclosing), error => error instanceof UnsupportedRequest);
+
+  // An open schema is untouched by the seal and is still widened.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
+test('a body with no tools, and a tool with no schema, do not throw', () => {
+  assert.deepEqual(portableSchemas({}), {});
+  assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'Read' }] }), { tools: [{ name: 'Read' }] });
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: null }] }).tools[0].input_schema, null);
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: { pattern: 5 } }] }).tools[0].input_schema.pattern, 5);
+});
+
 test('a name claimed by one request does not follow the next one', async () => {
   // The upstream echoes back the tool names it was given, so the test can see
   // what actually left the adapter.
@@ -2239,7 +2722,9 @@ and Notion tools can exceed that limit because Claude Code prefixes their names.
 The adapter replaces long names with deterministic, readable hashed aliases
 in tool definitions, tool choices, history, and tool references. It restores
 the original names in JSON and streaming responses before Claude Code sees them.
-Tool inputs, schemas, and text are not rewritten.
+Tool inputs, schemas, and text are not rewritten by the aliasing. One other
+transform reaches into tool schemas, and only to drop a constraint the provider
+cannot compile; see *Regex patterns in tool schemas* below.
 
 ## Web search
 
@@ -2257,6 +2742,65 @@ your Claude Code settings, or turn the WebSearch tool off.
 
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
+
+## Regex patterns in tool schemas
+
+Meta compiles every JSON Schema `pattern` a tool declares with a strict
+ECMA-262 validator, and refuses the whole request when one of them does not
+parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+property escapes, and in the CLI they sit in a regex literal carrying the `u`
+flag that gives them a meaning. A `pattern` is a bare string and carries no
+flags, so what arrives upstream is a regex the provider cannot compile.
+
+One bad schema among the whole set is enough to end every turn, so the symptom
+is that nothing works at all rather than that one tool is broken. The adapter
+removes any `pattern` containing `\p{` or `\P{` from `tools[].input_schema`,
+and leaves every other pattern in place. Only the constraint goes: `pattern`
+tells the provider what to reject, not the model what to send, so the tool
+description the model reads is unchanged and the tool still validates its own
+arguments when the call arrives.
+
+Dropping a constraint is safe because it widens the schema, and that is a
+property of what surrounds the constraint rather than of the constraint. A few
+keywords take it away. Under `not` the polarity reverses: `{not: {pattern:
+...}}` becomes `{not: {}}`, an empty schema accepts everything, so the
+negation rejects everything. `if` flips which branch applies, widening one
+`oneOf` branch can make two match and fail the whole, `maxContains` turns a
+weaker `contains` into more matches than the cap allows, and a restrictive
+`unevaluatedProperties` or `unevaluatedItems` rejects whatever no keyword
+marked evaluated.
+
+A schema that needs a pattern removed and contains any of those anywhere is
+refused locally with an explanation, the way a web search domain filter is.
+The test is presence, not position, so it also refuses schemas where the
+removal would in fact have been safe. Deciding otherwise means resolving
+`$ref` and tracking which object each keyword governs, which is most of a JSON
+Schema evaluator, and a partial one is exactly what makes a transform look
+correct while it quietly narrows what a tool accepts.
+
+A `patternProperties` key is a regular expression as much as a `pattern` is,
+and the provider compiles it the same way. There the whole entry goes, because
+the key cannot be dropped without it: the names it matched become
+unconstrained, and are still accepted. The exception is a sibling
+`additionalProperties` that would then reject those names, since matching a
+`patternProperties` key is what exempted them. Removing the entry would narrow
+what the tool accepts rather than widen it, so that request is refused too.
+
+Two things make this hard to recognise. The schema is behind a server-side
+feature gate, so the same CLI build fails on one machine and works on another,
+and the set of schemas sent can change with no update at all. And Claude Code
+does not send the Artifact tool on a `-p` run, so a print-mode smoke test
+passes while every interactive session dies. To see the failure on purpose, set
+`CLAUDE_CODE_ARTIFACT=1` on a `-p` run.
+
+If a future schema breaks in a way this transform does not cover, setting
+`CLAUDE_CODE_ARTIFACT_DB_STR_REPLACE` to any value at all turns the offending
+operation off without touching the adapter. It reads as a disable whatever it
+is set to, including `true`, because the CLI compares the variable against the
+boolean `true` and an environment variable is always a string. This is a
+stopgap: it gives up a working feature to route around one bad pattern, and the
+transform above is what closes the class.
 
 ## Auto mode
 
@@ -2591,8 +3135,9 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-seven offline tests in total: twenty in `adapter.test.cjs` and
-seventeen in `launcher.test.cjs`. All thirty-seven must pass on both platforms;
+There are forty-eight offline tests in total: thirty-one in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-eight must
+pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -2716,7 +3261,48 @@ repository. Clean up only the exact temporary directory created for this test.
 
 On every platform, confirm by hand that an interactive `claude-muse` session
 starts, sends one real message and gets an answer. A `-p` run does not exercise
-the same prompt-cache path, so it cannot prove the session will work. On native
+the same prompt-cache path, so it cannot prove the session will work. It also
+sends a different set of tools: the Artifact tool is absent from a print-mode
+run, so a tool schema the provider refuses can end every interactive turn while
+every `-p` check above stays green. Run one more print-mode check with that
+tool forced in, and require the same answer. On POSIX:
+
+```text
+CLAUDE_CODE_ARTIFACT=1 claude-muse -p 'Reply with exactly: MUSE WORKS' \
+  --no-session-persistence --output-format json
+```
+
+On Windows, in PowerShell:
+
+```powershell
+$env:CLAUDE_CODE_ARTIFACT = '1'
+claude-muse -p 'Reply with exactly: MUSE WORKS' `
+  --no-session-persistence --output-format json
+Remove-Item Env:\CLAUDE_CODE_ARTIFACT
+```
+
+A 400 reading `Invalid JSON schema` and quoting a regular expression here means
+the adapter is not stripping the patterns Meta cannot compile; fix that rather
+than pinning or downgrading Claude Code, which only moves the failure to the
+next release.
+
+This check can also pass while testing nothing, and saying which happened is
+part of reporting it. The schema that breaks is behind a server-side feature
+gate: on a machine outside that rollout the tool is still sent, but without the
+argument carrying the bad pattern, so the check goes green without ever
+exercising it. There is no way to force the gate on from the outside. Report
+which case this machine is in:
+
+```text
+node -p "require(require('os').homedir()+'/.claude.json').cachedGrowthBookFeatures?.tengu_umber_stile ?? 'absent'"
+```
+
+`true` means the check exercised the schema. Anything else means it did not,
+and that this machine will begin to whenever the gate reaches it - with no
+update, and no warning. `absent` is one of those answers rather than a broken
+command: the gate cache is written when Claude Code can reach the service, so
+a machine that has not been told yet is one the schema has not reached
+either. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run

@@ -5,7 +5,7 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs thirty-seven offline
+detects the platform once and follows only that branch; it writes the files, runs forty-eight offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
@@ -24,7 +24,7 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
 ~/.local/lib/claude-muse/launcher.test.cjs   seventeen offline tests
-~/.local/lib/claude-muse/adapter.test.cjs    twenty offline tests
+~/.local/lib/claude-muse/adapter.test.cjs    thirty-one offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
 ~/.config/claude-muse/provider.env   base URL, model, effort, idle timeout — and your key
 ```
@@ -47,15 +47,22 @@ anticipated:
 | `cache_control` carrying `ttl` or `scope` | `cache_control.ttl: 1h is not supported` | Reduces it to the plain `{"type":"ephemeral"}` form |
 | `max_uses` on `web_search_20250305` | `web_search field max_uses is not supported` | Drops the field; the provider applies its own cap |
 | `stop_sequences` on the auto-mode classifier | `stop_sequences is not supported` | Drops the field |
+| A tool schema `pattern` written with `\p{...}` | `Invalid JSON schema: "..." is not a "regex"` | Drops that one constraint; refuses locally in the one case where dropping it would narrow the schema |
 
-The last row is worth spelling out, because its symptom names nothing. Claude Code reports that
-particular 400 as *"the model is temporarily unavailable"*, so auto mode stops running Bash, Edit
-and Agent while reading files carries on working — which looks like an outage rather than a
-rejected field.
+The last two rows are worth spelling out, because neither symptom names anything. Claude Code
+reports the `stop_sequences` 400 as *"the model is temporarily unavailable"*, so auto mode stops
+running Bash, Edit and Agent while reading files carries on working — which looks like an outage
+rather than a rejected field. And one unusable `pattern` anywhere in the tool set ends every
+request in the session, so that one reads as the model being down rather than as a single tool
+being broken. It also arrives without a Claude Code update, because the schema carrying it is
+released by a server-side feature gate.
 
-The adapter rewrites protocol metadata only. Tool inputs, tool schemas and message text pass
-through untouched, so a field named `cache_control` inside an MCP tool's own schema stays exactly
-as that tool defined it.
+The adapter rewrites protocol metadata, and reaches past it in exactly one place. Tool inputs and
+message text pass through untouched, so a field named `cache_control` inside an MCP tool's own
+schema stays exactly as that tool defined it. Tool schemas pass through untouched too, apart from
+the last row: a `pattern` the provider cannot compile is removed, and nothing else in a schema is
+read or changed. If a tool ever finds a constraint it declared missing, that row is the only thing
+here that could have removed it.
 
 In a typical setup only one MCP tool name crosses 64 characters, which makes the proxy look
 avoidable. It is not: `ENABLE_TOOL_SEARCH=true` changes *when* that definition travels, not

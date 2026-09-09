@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -468,6 +468,262 @@ test('web_search keeps only the fields Meta accepts; domain filters are refused'
       error => error instanceof UnsupportedRequest && error.message.includes(field)
     );
   }
+});
+
+test('a Unicode-property pattern is dropped from a tool schema, and nothing else is', () => {
+  // The pattern Claude Code 2.1.266 puts on Artifact's `field` argument, taken
+  // off the wire. In the CLI it is a regex literal carrying the `u` flag that
+  // gives \p{Cc} its meaning; a JSON Schema `pattern` is a bare string with no
+  // flags, so what reaches the provider is a regex it refuses to compile.
+  const artifact = '^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}"\\\\./[\\]]{1,200}$';
+  const plain = '^[a-z0-9_-]+$';
+  const body = portableSchemas({
+    tools: [
+      { name: 'Artifact', input_schema: { type: 'object', $defs: { id: { type: 'string', pattern: '^\\p{Nd}{4}$' } }, properties: {
+        field: { type: 'string', description: 'kept', pattern: artifact },
+        collection: { type: 'string', pattern: plain },
+        doc: { anyOf: [{ type: 'string', pattern: '\\p{L}+' }, { type: 'string', pattern: plain }] },
+        rows: { items: { type: 'string', pattern: '\\P{N}' } },
+      } } },
+      { name: 'Read' },
+      { type: 'web_search_20250305', name: 'web_search' },
+    ],
+    messages: [{ content: [{ type: 'tool_use', name: 'Artifact', input: { pattern: '\\p{L}' } }] }],
+  });
+  const schema = body.tools[0].input_schema;
+  assert.ok(!('pattern' in schema.properties.field));
+  assert.equal(schema.properties.doc.anyOf[0].pattern, undefined);
+  assert.equal(schema.properties.rows.items.pattern, undefined);
+  assert.equal(schema.$defs.id.pattern, undefined);
+  // A pattern the provider can compile is a useful constraint and stays.
+  assert.equal(schema.properties.collection.pattern, plain);
+  assert.equal(schema.properties.doc.anyOf[1].pattern, plain);
+  // Only the constraint goes. The property it constrained, and everything the
+  // model reads to decide how to call the tool, are left exactly as they were.
+  assert.equal(schema.properties.field.type, 'string');
+  assert.equal(schema.properties.field.description, 'kept');
+  // Tool definitions only. A past call's arguments are the conversation, and a
+  // tool is free to take an argument of its own called `pattern`.
+  assert.equal(body.messages[0].content[0].input.pattern, '\\p{L}');
+});
+
+test('a pattern that is a value rather than a constraint is left alone', () => {
+  // `const`, `default`, `enum` and `examples` hold arbitrary JSON, not
+  // subschemas. An object inside one of them may have a member named `pattern`,
+  // and deleting it would change a value the tool receives instead of a
+  // constraint the provider enforces.
+  const body = portableSchemas({ tools: [{ name: 'Grep', input_schema: {
+    type: 'object',
+    properties: {
+      rule: { type: 'object', default: { pattern: '\\p{L}+' }, const: { pattern: '\\p{M}' } },
+      mode: { enum: [{ pattern: '\\p{N}' }], examples: [{ pattern: '\\p{L}' }] },
+    },
+  } }] });
+  const props = body.tools[0].input_schema.properties;
+  assert.equal(props.rule.default.pattern, '\\p{L}+');
+  assert.equal(props.rule.const.pattern, '\\p{M}');
+  assert.equal(props.mode.enum[0].pattern, '\\p{N}');
+  assert.equal(props.mode.examples[0].pattern, '\\p{L}');
+});
+
+test('a tool argument named like a schema keyword is still a schema', () => {
+  // `properties` and `$defs` map a name the tool chose to a subschema, and that
+  // name is not a JSON Schema keyword. Reading an argument called `default` or
+  // `enum` as the keyword of the same spelling would skip its schema and leave
+  // the pattern in place, which is the 400 this transform exists to prevent.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    $defs: { enum: { type: 'string', pattern: '\\p{Lu}' } },
+    // draft-07 `dependencies` keys by property name too, and its values are a
+    // subschema or a list of required property names.
+    dependencies: { default: { properties: { x: { type: 'string', pattern: '\\p{S}' } } }, ok: ['y'] },
+    properties: {
+      default: { type: 'string', pattern: '\\p{L}+' },
+      enum: { type: 'string', pattern: '\\p{N}+' },
+      examples: { items: { type: 'string', pattern: '\\p{M}' } },
+      // A property whose own name is a schema-map keyword is no different.
+      properties: { type: 'string', pattern: '\\p{P}' },
+    },
+    // The same spellings one level up really are keywords, and hold values.
+    default: { pattern: '\\p{L}' },
+    enum: [{ pattern: '\\p{N}' }],
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.properties.default.pattern, undefined);
+  assert.equal(schema.properties.enum.pattern, undefined);
+  assert.equal(schema.properties.examples.items.pattern, undefined);
+  assert.equal(schema.properties.properties.pattern, undefined);
+  assert.equal(schema.$defs.enum.pattern, undefined);
+  assert.equal(schema.dependencies.default.properties.x.pattern, undefined);
+  assert.deepEqual(schema.dependencies.ok, ['y']);
+  assert.equal(schema.default.pattern, '\\p{L}');
+  assert.equal(schema.enum[0].pattern, '\\p{N}');
+});
+
+test('an unknown keyword is read as a schema; a named annotation is not', () => {
+  // A keyword this walker has never heard of is walked as a schema. Guessing
+  // wrong that way drops a constraint the provider was going to enforce and
+  // widens what the request may carry; guessing wrong the other way leaves a
+  // pattern the provider refuses, which ends every turn in the session. Only
+  // the second is worth avoiding, so the unknown case is not left to a list of
+  // schema-bearing keywords that would have to be complete to be safe.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    // Values, by name and by the `x-` extension space. Left alone.
+    example: { pattern: '\\p{L}+' },
+    'x-vendor': { metadata: { pattern: '\\p{N}+' } },
+    properties: {
+      // `contentSchema` really is a subschema keyword, and this walker does
+      // not list it. The catch-all is what keeps that from mattering.
+      doc: { type: 'string', contentSchema: { type: 'string', pattern: '\\p{M}' } },
+    },
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.example.pattern, '\\p{L}+');
+  assert.equal(schema['x-vendor'].metadata.pattern, '\\p{N}+');
+  assert.equal(schema.properties.doc.contentSchema.pattern, undefined);
+});
+
+test('a patternProperties key is a regex too, and is dropped or refused', () => {
+  // The key of a `patternProperties` entry is itself a regular expression the
+  // provider compiles, so the same escapes are fatal there and walking only
+  // the values would leave the request refused for the same reason.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    patternProperties: {
+      '^\\p{L}+$': { type: 'string', pattern: '\\p{N}' },
+      '^[a-z]+$': { type: 'string', pattern: '\\p{M}' },
+    },
+  } }] });
+  const map = body.tools[0].input_schema.patternProperties;
+  // The entry goes with its key: what it constrained becomes unconstrained,
+  // which is a widening, and the properties it matched are still accepted.
+  assert.deepEqual(Object.keys(map), ['^[a-z]+$']);
+  // The surviving entry is still a schema and is still cleaned.
+  assert.equal(map['^[a-z]+$'].pattern, undefined);
+  assert.equal(map['^[a-z]+$'].type, 'string');
+});
+
+test('a patternProperties key cannot be dropped where additionalProperties would reject it', () => {
+  // Removing the entry stops exempting the names it matched, so a restrictive
+  // `additionalProperties` turns the widening into a narrowing: arguments the
+  // tool declared valid would start being rejected. That is a change to what
+  // the tool accepts, and it is not the adapter's to make silently.
+  for (const additional of [false, { type: 'string' }]) {
+    assert.throws(
+      () => portableSchemas({ tools: [{ name: 'X', input_schema: {
+        type: 'object',
+        additionalProperties: additional,
+        patternProperties: { '^\\p{L}+$': { type: 'string' } },
+      } }] }),
+      error => error instanceof UnsupportedRequest && error.message.includes('\\p{L}')
+    );
+  }
+  // An open schema is the ordinary case and is widened rather than refused.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    additionalProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
+test('a pattern under an applicator that inverts is refused, not dropped', () => {
+  // Dropping a constraint widens the schema it sits in, and that is what makes
+  // dropping safe - but only where the schema around it is monotonic. Under
+  // `not` the polarity reverses: `{not: {pattern: ...}}` becomes `{not: {}}`,
+  // and the empty schema accepts everything, so the negation rejects
+  // everything. `if` flips which branch applies, and widening one `oneOf`
+  // branch can make two match and fail the whole. Those cannot be widened, so
+  // they are refused with an explanation rather than silently narrowed.
+  const under = shape => ({ tools: [{ name: 'X', input_schema: { type: 'object', properties: { s: shape } } }] });
+  for (const shape of [
+    { not: { pattern: '\\p{L}+' } },
+    { if: { pattern: '\\p{L}+' }, then: { minLength: 2 } },
+    { oneOf: [{ pattern: '\\p{L}+' }, { type: 'number' }] },
+    // Depth does not restore the guarantee: still inside the negation.
+    { not: { properties: { t: { items: { pattern: '\\p{L}+' } } } } },
+  ]) {
+    assert.throws(
+      () => portableSchemas(under(shape)),
+      error => error instanceof UnsupportedRequest && /not|if|oneOf/.test(error.message)
+    );
+  }
+});
+
+test('the applicators that preserve widening still drop', () => {
+  // `allOf`, `anyOf`, `contains` and `propertyNames` all get weaker when a
+  // subschema does, so the guarantee holds under them and the pattern goes.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    allOf: [{ pattern: '\\p{L}' }],
+    anyOf: [{ pattern: '\\p{N}' }],
+    contains: { pattern: '\\p{M}' },
+    propertyNames: { pattern: '\\p{P}' },
+    $defs: { named: { pattern: '\\p{S}' } },
+  } }] });
+  const s = body.tools[0].input_schema;
+  for (const at of [s.allOf[0], s.anyOf[0], s.contains, s.propertyNames, s.$defs.named]) {
+    assert.equal(at.pattern, undefined);
+  }
+});
+
+test('a keyword that removes the guarantee refuses the whole schema', () => {
+  // The check is presence, not position. A schema carrying one of these
+  // keywords anywhere is refused even where the pattern itself sits somewhere
+  // that would have been safe, because deciding otherwise means resolving
+  // references and tracking instance locations - most of a schema evaluator,
+  // and a partial one is what lets a transform narrow a schema quietly.
+  const refused = schema => assert.throws(
+    () => portableSchemas({ tools: [{ name: 'X', input_schema: schema }] }),
+    error => error instanceof UnsupportedRequest
+  );
+  // A definition cleaned where it is stored, applied under a negation.
+  refused({ $defs: { bad: { pattern: '\\p{L}+' } }, not: { $ref: '#/$defs/bad' } });
+  // `maxContains`: a weaker `contains` matches more elements than the cap.
+  refused({ type: 'array', contains: { pattern: '\\p{N}+' }, maxContains: 1 });
+  // The pattern is in a plainly monotonic place; the `if` elsewhere is enough.
+  refused({ type: 'object', if: { type: 'string' }, properties: { s: { pattern: '\\p{L}' } } });
+  // With nothing to remove, none of these keywords matter at all.
+  const untouched = { type: 'object', not: { pattern: '^[a-z]+$' }, maxContains: 1 };
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'X', input_schema: untouched }] }).tools[0].input_schema, untouched);
+});
+
+test('a patternProperties entry sealed by unevaluatedProperties is refused', () => {
+  // `unevaluatedProperties: false` rejects what no keyword marked evaluated,
+  // and matching a `patternProperties` key is what marked those names. Delete
+  // the entry and they become unevaluated, so the schema narrows exactly as it
+  // does under a restrictive `additionalProperties`. Only a restrictive one
+  // counts: `true` rejects nothing and leaves the removal a widening.
+  const sealed = { tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: false,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] };
+  assert.throws(() => portableSchemas(sealed), error => error instanceof UnsupportedRequest);
+
+  const enclosing = { tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: false,
+    allOf: [{ patternProperties: { '^\\p{L}+$': { type: 'string' } } }],
+  } }] };
+  assert.throws(() => portableSchemas(enclosing), error => error instanceof UnsupportedRequest);
+
+  // An open schema is untouched by the seal and is still widened.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
+test('a body with no tools, and a tool with no schema, do not throw', () => {
+  assert.deepEqual(portableSchemas({}), {});
+  assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'Read' }] }), { tools: [{ name: 'Read' }] });
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: null }] }).tools[0].input_schema, null);
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: { pattern: 5 } }] }).tools[0].input_schema.pattern, 5);
 });
 
 test('a name claimed by one request does not follow the next one', async () => {
