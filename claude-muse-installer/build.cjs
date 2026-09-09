@@ -91,6 +91,19 @@ function render(dir = __dirname) {
         'Save the file with Unix line endings.'
       );
     }
+    // A source has to end with a newline, because the block will. Rendering
+    // writes the last line and then the closing fence, and an extractor reading
+    // the block back writes that line terminator into the installed file - so a
+    // source saved without one is silently one byte short of what an install
+    // gets, while every check still passes. Refuse it rather than add it: the
+    // repair recipe in the README says these files can be copied over their
+    // installed twins, and that has to be true byte for byte.
+    if (!raw.endsWith('\n')) {
+      throw new Error(
+        `${source} does not end with a newline, so it is not the file the block ` +
+        'would install. Add the final newline.'
+      );
+    }
     // One trailing newline is the file ending, not a blank last line of the
     // block. Anything beyond it is content and survives.
     const text = raw.replace(/\n$/, '');
