@@ -1,0 +1,6 @@
+# Every file here is an artifact whose bytes matter. prompt.md is generated from
+# sources/ byte for byte, and it carries no CR anywhere: the CRLF that
+# claude-muse.cmd needs on Windows is an instruction in the prose, not a
+# property of the block. Line-ending conversion on checkout would rewrite the
+# prompt and fail the build check on a Windows clone.
+* -text

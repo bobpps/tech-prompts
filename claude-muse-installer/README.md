@@ -203,6 +203,46 @@ claude-muse --effort low   # override the default effort
 `Path` is set through `[Environment]::SetEnvironmentVariable` rather than `setx`, which truncates
 values at 1024 characters — and the change only reaches newly opened terminals.
 
+## Changing it
+
+The prompt is generated. Its prose lives in `prompt.template.md`, the eight files it dictates live
+in `sources/`, and `prompt.md` is what the two produce:
+
+```text
+claude-muse-installer/
+├── prompt.template.md   the prose, with a marker where each file goes
+├── sources/             the eight files, mirroring the installed tree
+├── build.cjs            template + sources -> prompt.md
+└── prompt.md            generated, committed, and the file you paste
+```
+
+Edit code in `sources/`, never in `prompt.md`, then rebuild and commit both:
+
+```text
+node claude-muse-installer/build.cjs
+```
+
+The checker fails if you forget, and says what to run. Fence length is computed rather than
+chosen, so a file that contains a fence of its own is wrapped in a longer one automatically — the
+failure that once truncated the installed README to a third of its length can no longer be written
+by hand.
+
+`sources/` mirrors the installed tree minus the leading dots, and every file in it is
+byte-identical to what an install writes. A machine whose adapter has stopped working is therefore
+repaired by copying one file over its twin, with no reinstall:
+
+```text
+cp claude-muse-installer/sources/lib/claude-muse/adapter.cjs ~/.local/lib/claude-muse/
+node --test ~/.local/lib/claude-muse/*.test.cjs
+```
+
+The suites also run straight from the repository, which is the fast loop while changing the
+adapter:
+
+```text
+node --test claude-muse-installer/sources/lib/claude-muse/*.test.cjs
+```
+
 ## Checking the prompt
 
 ```text
@@ -210,10 +250,12 @@ node claude-muse-installer/check.cjs
 ```
 
 Extracts all eight files the prompt dictates into a temporary directory, parses the JavaScript,
-runs both test suites, and checks that the test counts quoted in the prose match the counts that
-ran. It also refuses a fenced block that ends early because it contains a fence of its own — the
-failure that once truncated the installed README to a third of its length. No API key, no
-network, about two seconds. It verifies mechanism only; the prose still needs a reader.
+runs both test suites, checks that the test counts quoted in the prose match the counts that ran,
+and rebuilds the prompt from `sources/` to confirm that the file you would paste is the code
+somebody actually edited. It also refuses a fenced block that ends early because it contains a
+fence of its own — the failure that once truncated the installed README to a third of its length.
+No API key, no network, about two seconds. It verifies mechanism only; the prose still needs a
+reader.
 
 ## Source
 

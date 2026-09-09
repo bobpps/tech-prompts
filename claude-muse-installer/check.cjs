@@ -3,8 +3,9 @@
 //
 // The prompt tells an agent to write eight files verbatim, four of them running
 // code. Nothing else verifies that those blocks can be extracted whole, that the
-// code parses, that its own tests pass, or that the counts quoted in the prose
-// still match. This does, offline and without an API key.
+// code parses, that its own tests pass, that the counts quoted in the prose
+// still match, or that the generated prompt still agrees with the sources it
+// was generated from. This does, offline and without an API key.
 //
 //   node claude-muse-installer/check.cjs [path/to/prompt.md]
 //
@@ -125,6 +126,33 @@ if (!layout) {
   for (const entry of listed) if (!declared.has(entry)) fail(`${entry} is listed in the layout but no block writes it`);
   for (const entry of declared.keys()) if (!listed.includes(entry)) fail(`${entry} is written by a block but missing from the layout`);
   note(`${listed.length} files listed in the layout, ${declared.size} written by blocks`);
+}
+
+// ---------------------------------------------------------------- generated
+
+// prompt.md is rendered from prompt.template.md and sources/, so the file a
+// reader pastes can drift from the code somebody actually edited - a fix landed
+// in sources/ and never built is a fix nobody receives. Rebuild it here and
+// compare. Skipped when the checker is pointed at a copy of the prompt with no
+// build beside it, which is how it stays runnable against an extracted file.
+const buildPath = path.resolve(path.dirname(promptPath), 'build.cjs');
+if (!fs.existsSync(buildPath)) {
+  note('no build.cjs beside the prompt; it was not compared with sources/');
+} else {
+  try {
+    const { render } = require(buildPath);
+    const rendered = render(path.resolve(path.dirname(promptPath))).text;
+    if (rendered === fs.readFileSync(promptPath, 'utf8')) {
+      note('prompt.md matches prompt.template.md and sources/');
+    } else {
+      fail(
+        'prompt.md does not match prompt.template.md and sources/ - ' +
+        'run `node claude-muse-installer/build.cjs`'
+      );
+    }
+  } catch (error) {
+    fail('the prompt could not be rebuilt from sources/: ' + error.message);
+  }
 }
 
 // ---------------------------------------------------------------- run
