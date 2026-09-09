@@ -215,7 +215,43 @@ First inspect the environment:
    non-empty `MUSE_AUTH_TOKEN`. Before replacing any other existing target,
    make a timestamped backup under `~/.local/lib/claude-muse/backups/`, readable
    only by the current user where the platform allows it. Never display the
-   secret while doing so.
+   secret while doing so. An installation that is already there is an update
+   rather than a fresh install; follow the procedure directly below.
+
+Updating an existing installation:
+
+This prompt is also the update procedure. The blocks below are the current
+contents of every installed file, so an installation that predates them is
+brought forward by reconciling each file against its block. Nothing here
+reaches the network or a repository, and there is no version to compare: the
+blocks are authoritative, and an installed file that differs from its block is
+either older than this prompt or locally modified. Both are resolved the same
+way.
+
+If `~/.local/lib/claude-muse` already exists, do this before writing anything:
+
+- Compare each target file for this platform against its block by content, not
+  by eye, and report which ones differ before changing any of them.
+- Three files are deliberately not literal copies of their blocks. Comparing
+  them naively reports a difference that is not one:
+  - `~/.config/claude-muse/provider.env` carries the key. Keep an existing
+    non-empty `MUSE_AUTH_TOKEN` line unchanged and reconcile only the other
+    settings. Never print the key while comparing.
+  - `~/.local/bin/claude-muse.cmd` is installed with CRLF line endings.
+    Compare it with line endings normalised.
+  - `~/.local/bin/claude-muse` has its last line rewritten under Git Bash where
+    `$HOME` and `os.homedir()` disagree. Leave that rewrite in place, and
+    re-apply it if you replace the file.
+- Replace only the files that differ, backing each one up first as step 7 says.
+  Leave earlier backups alone.
+- Then run the offline tests and every live check below again, in full. An
+  update is not finished when the files are written. The adapter is the layer
+  that absorbs provider incompatibilities, so a changed adapter is exactly the
+  thing that can turn a working installation into one that fails on every turn,
+  and only a real session proves that it did not.
+
+Report which files you replaced, which you left unchanged, and where the
+backups went.
 
 Permissions differ by platform, and this is the one place where the two
 installations are not equivalent.
