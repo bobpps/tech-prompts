@@ -642,12 +642,15 @@ exercising it. There is no way to force the gate on from the outside. Report
 which case this machine is in:
 
 ```text
-node -p "require(require('os').homedir()+'/.claude.json').cachedGrowthBookFeatures.tengu_umber_stile"
+node -p "require(require('os').homedir()+'/.claude.json').cachedGrowthBookFeatures?.tengu_umber_stile ?? 'absent'"
 ```
 
 `true` means the check exercised the schema. Anything else means it did not,
 and that this machine will begin to whenever the gate reaches it - with no
-update, and no warning. On native
+update, and no warning. `absent` is one of those answers rather than a broken
+command: the gate cache is written when Claude Code can reach the service, so
+a machine that has not been told yet is one the schema has not reached
+either. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run
