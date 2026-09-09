@@ -1011,6 +1011,10 @@ class ToolNames {
 // whole body would silently reduce an MCP schema property of that name to
 // `{"type": ...}`, dropping its own `properties` and `description` on the way
 // through, and the tool would then be described wrongly to the model.
+//
+// `portableSchemas` below is the one transform that does reach into
+// `input_schema`, and it removes a single unusable constraint rather than
+// rewriting anything. Nothing else in this file reads a tool's own data.
 // FORCE_PROMPT_CACHING_5M pins the provider default at the source, and with
 // that variable set a direct connection never produced the 400 this guards
 // against, so on a good day nothing here fires. It stays anyway. That variable
@@ -1108,11 +1112,19 @@ function webSearchTools(body) {
 // But `properties` and `$defs` map a name the tool chose to a subschema, and
 // those names are not keywords: an argument called `default` is a schema and
 // has to be descended into, or its pattern survives and produces the very 400
-// this prevents. The schema maps are listed rather than detected because
-// missing one puts its subschemas back under keyword rules.
+// this prevents.
+//
+// The maps are listed rather than detected, because missing one puts its
+// subschemas back under keyword rules. This is every keyword across draft-07,
+// 2019-09 and 2020-12 whose value is keyed by a name the tool chose;
+// `dependencies` is in it for its draft-07 subschema form, and its other form,
+// a list of required property names, is walked harmlessly. `dependentRequired`
+// is absent because it only ever holds those lists.
 const UNICODE_PROPERTY = /\\[pP]\{/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
-const SCHEMA_MAPS = ['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'];
+const SCHEMA_MAPS = [
+  'properties', 'patternProperties', '$defs', 'definitions', 'dependencies', 'dependentSchemas',
+];
 
 function portableSchemas(body) {
   for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);
@@ -2269,6 +2281,9 @@ test('a tool argument named like a schema keyword is still a schema', () => {
   const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
     type: 'object',
     $defs: { enum: { type: 'string', pattern: '\\p{Lu}' } },
+    // draft-07 `dependencies` keys by property name too, and its values are a
+    // subschema or a list of required property names.
+    dependencies: { default: { properties: { x: { type: 'string', pattern: '\\p{S}' } } }, ok: ['y'] },
     properties: {
       default: { type: 'string', pattern: '\\p{L}+' },
       enum: { type: 'string', pattern: '\\p{N}+' },
@@ -2286,6 +2301,8 @@ test('a tool argument named like a schema keyword is still a schema', () => {
   assert.equal(schema.properties.examples.items.pattern, undefined);
   assert.equal(schema.properties.properties.pattern, undefined);
   assert.equal(schema.$defs.enum.pattern, undefined);
+  assert.equal(schema.dependencies.default.properties.x.pattern, undefined);
+  assert.deepEqual(schema.dependencies.ok, ['y']);
   assert.equal(schema.default.pattern, '\\p{L}');
   assert.equal(schema.enum[0].pattern, '\\p{N}');
 });
@@ -2433,7 +2450,9 @@ and Notion tools can exceed that limit because Claude Code prefixes their names.
 The adapter replaces long names with deterministic, readable hashed aliases
 in tool definitions, tool choices, history, and tool references. It restores
 the original names in JSON and streaming responses before Claude Code sees them.
-Tool inputs, schemas, and text are not rewritten.
+Tool inputs, schemas, and text are not rewritten by the aliasing. One other
+transform reaches into tool schemas, and only to drop a constraint the provider
+cannot compile; see *Regex patterns in tool schemas* below.
 
 ## Web search
 

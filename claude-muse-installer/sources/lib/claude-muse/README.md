@@ -26,7 +26,9 @@ and Notion tools can exceed that limit because Claude Code prefixes their names.
 The adapter replaces long names with deterministic, readable hashed aliases
 in tool definitions, tool choices, history, and tool references. It restores
 the original names in JSON and streaming responses before Claude Code sees them.
-Tool inputs, schemas, and text are not rewritten.
+Tool inputs, schemas, and text are not rewritten by the aliasing. One other
+transform reaches into tool schemas, and only to drop a constraint the provider
+cannot compile; see *Regex patterns in tool schemas* below.
 
 ## Web search
 

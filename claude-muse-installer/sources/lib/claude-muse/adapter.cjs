@@ -211,6 +211,10 @@ class ToolNames {
 // whole body would silently reduce an MCP schema property of that name to
 // `{"type": ...}`, dropping its own `properties` and `description` on the way
 // through, and the tool would then be described wrongly to the model.
+//
+// `portableSchemas` below is the one transform that does reach into
+// `input_schema`, and it removes a single unusable constraint rather than
+// rewriting anything. Nothing else in this file reads a tool's own data.
 // FORCE_PROMPT_CACHING_5M pins the provider default at the source, and with
 // that variable set a direct connection never produced the 400 this guards
 // against, so on a good day nothing here fires. It stays anyway. That variable
@@ -308,11 +312,19 @@ function webSearchTools(body) {
 // But `properties` and `$defs` map a name the tool chose to a subschema, and
 // those names are not keywords: an argument called `default` is a schema and
 // has to be descended into, or its pattern survives and produces the very 400
-// this prevents. The schema maps are listed rather than detected because
-// missing one puts its subschemas back under keyword rules.
+// this prevents.
+//
+// The maps are listed rather than detected, because missing one puts its
+// subschemas back under keyword rules. This is every keyword across draft-07,
+// 2019-09 and 2020-12 whose value is keyed by a name the tool chose;
+// `dependencies` is in it for its draft-07 subschema form, and its other form,
+// a list of required property names, is walked harmlessly. `dependentRequired`
+// is absent because it only ever holds those lists.
 const UNICODE_PROPERTY = /\\[pP]\{/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
-const SCHEMA_MAPS = ['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'];
+const SCHEMA_MAPS = [
+  'properties', 'patternProperties', '$defs', 'definitions', 'dependencies', 'dependentSchemas',
+];
 
 function portableSchemas(body) {
   for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);

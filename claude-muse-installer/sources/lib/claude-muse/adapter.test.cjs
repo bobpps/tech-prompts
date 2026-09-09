@@ -534,6 +534,9 @@ test('a tool argument named like a schema keyword is still a schema', () => {
   const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
     type: 'object',
     $defs: { enum: { type: 'string', pattern: '\\p{Lu}' } },
+    // draft-07 `dependencies` keys by property name too, and its values are a
+    // subschema or a list of required property names.
+    dependencies: { default: { properties: { x: { type: 'string', pattern: '\\p{S}' } } }, ok: ['y'] },
     properties: {
       default: { type: 'string', pattern: '\\p{L}+' },
       enum: { type: 'string', pattern: '\\p{N}+' },
@@ -551,6 +554,8 @@ test('a tool argument named like a schema keyword is still a schema', () => {
   assert.equal(schema.properties.examples.items.pattern, undefined);
   assert.equal(schema.properties.properties.pattern, undefined);
   assert.equal(schema.$defs.enum.pattern, undefined);
+  assert.equal(schema.dependencies.default.properties.x.pattern, undefined);
+  assert.deepEqual(schema.dependencies.ok, ['y']);
   assert.equal(schema.default.pattern, '\\p{L}');
   assert.equal(schema.enum[0].pattern, '\\p{N}');
 });
