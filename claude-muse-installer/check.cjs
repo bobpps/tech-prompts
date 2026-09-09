@@ -34,14 +34,18 @@ const NUMBERS = {
 
 // ---------------------------------------------------------------- parse
 
-const lines = fs.readFileSync(promptPath, 'utf8').split(/\r?\n/);
+const rawPrompt = fs.readFileSync(promptPath, 'utf8');
+const lines = rawPrompt.split(/\r?\n/);
 
 // Walks the document as CommonMark does: a fence closes at the first line whose
-// run of backticks is at least as long as the one that opened it.
+// run of backticks is at least as long as the one that opened it, and either
+// fence may sit under as many as three spaces of indentation. Reading only
+// column zero would miss an indented fence that ends a block early and report
+// the truncated prompt as whole.
 function readBlocks() {
   const blocks = [];
   for (let i = 0; i < lines.length; i++) {
-    const open = lines[i].match(/^(`{3,})(.*)$/);
+    const open = lines[i].match(/^ {0,3}(`{3,})(.*)$/);
     if (!open) continue;
     const ticks = open[1];
     const info = open[2].trim();
@@ -49,7 +53,7 @@ function readBlocks() {
     let closedAt = -1;
     let closingInfo = '';
     for (let j = i + 1; j < lines.length; j++) {
-      const close = lines[j].match(/^(`{3,})(.*)$/);
+      const close = lines[j].match(/^ {0,3}(`{3,})(.*)$/);
       if (close && close[1].length >= ticks.length) {
         closedAt = j;
         closingInfo = close[2].trim();
@@ -95,6 +99,13 @@ for (const block of blocks) {
 }
 
 // ---------------------------------------------------------------- structure
+
+// The prompt is LF throughout, and the split above would hide a stray carriage
+// return by consuming it. A CR that reached the prompt is copied verbatim into
+// an installed file, where `#!/usr/bin/env bash\r` stops being a shebang.
+if (rawPrompt.includes('\r')) {
+  fail(`${label} contains a carriage return; the prompt is LF only`);
+}
 
 // A fence that closes a block never carries an info string. One that does was
 // meant to open a nested block, and has silently ended its parent instead —

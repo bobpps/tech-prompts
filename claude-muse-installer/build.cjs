@@ -22,13 +22,16 @@ const path = require('node:path');
 const MARKER = /^<!--\s*muse:file\s+(\S+)\s+lang=(\S*)\s*-->$/;
 
 // A fence closes at the first line whose run of backticks is at least as long
-// as the one that opened it, so the opening run has to beat every run that
-// starts a line inside the file. Only line-leading runs can close a block;
-// backticks inside a sentence never do.
+// as the one that opened it, so the opening run has to beat every run inside
+// the file that could close it. Backticks inside a sentence never can, but
+// CommonMark lets a closing fence sit under as many as three spaces of
+// indentation - a run at column three ends the block exactly as one at column
+// zero does. Measuring only column zero is how a file containing an indented
+// fence gets wrapped in one too short and silently truncated at that line.
 function fenceFor(body) {
   let longest = 0;
   for (const line of body) {
-    const run = line.match(/^(`+)/);
+    const run = line.match(/^ {0,3}(`+)/);
     if (run && run[1].length > longest) longest = run[1].length;
   }
   return '`'.repeat(Math.max(3, longest + 1));
@@ -74,9 +77,23 @@ function render(dir = __dirname) {
         `${templatePath}:${index + 1} writes ${target} from ${source}; the file names differ`
       );
     }
+    // The prompt is LF throughout: it contains no carriage return anywhere, and
+    // the CRLF that claude-muse.cmd needs on Windows is an instruction in the
+    // prose rather than a property of its block. A source saved with CRLF would
+    // copy those bytes into the prompt, where nothing downstream would notice -
+    // the checker parses with /\r?\n/ and would test an LF copy of a file that
+    // ships as `#!/usr/bin/env bash\r`, which is not a shebang. Refuse it here,
+    // which is the only place that reads the source as bytes.
+    const raw = fs.readFileSync(file, 'utf8');
+    if (raw.includes('\r')) {
+      throw new Error(
+        `${source} contains a carriage return; the prompt is LF only. ` +
+        'Save the file with Unix line endings.'
+      );
+    }
     // One trailing newline is the file ending, not a blank last line of the
     // block. Anything beyond it is content and survives.
-    const text = fs.readFileSync(file, 'utf8').replace(/\n$/, '');
+    const text = raw.replace(/\n$/, '');
     const body = text.split('\n');
     const fence = fenceFor(body);
     out.push(fence + lang, ...body, fence);

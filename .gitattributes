@@ -3,4 +3,9 @@
 # claude-muse.cmd needs on Windows is an instruction in the prose, not a
 # property of the block. Line-ending conversion on checkout would rewrite the
 # prompt and fail the build check on a Windows clone.
+#
+# This setting stops Git from converting; it cannot stop an editor from saving
+# CRLF in the first place. build.cjs refuses such a source, and check.cjs
+# refuses a prompt that carries a CR, so the invariant is enforced rather than
+# merely requested.
 * -text

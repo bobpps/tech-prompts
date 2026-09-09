@@ -222,10 +222,15 @@ Edit code in `sources/`, never in `prompt.md`, then rebuild and commit both:
 node claude-muse-installer/build.cjs
 ```
 
-The checker fails if you forget, and says what to run. Fence length is computed rather than
-chosen, so a file that contains a fence of its own is wrapped in a longer one automatically — the
-failure that once truncated the installed README to a third of its length can no longer be written
-by hand.
+The checker fails if you forget, and says what to run. Fence length is computed rather than chosen,
+so a file that contains a fence of its own is wrapped in a longer one automatically — including a
+fence indented under three spaces, which CommonMark lets close a block just as one at column zero
+does. That is the failure that once truncated the installed README to a third of its length, and it
+can no longer be written by hand.
+
+Sources are LF only. `build.cjs` refuses one carrying a carriage return and `check.cjs` refuses a
+prompt that carries one, because a CR copied into the POSIX shim would leave `#!/usr/bin/env bash`
+followed by a carriage return, which is not a shebang.
 
 `sources/` mirrors the installed tree minus the leading dots, and every file in it is
 byte-identical to what an install writes. A machine whose adapter has stopped working is therefore
