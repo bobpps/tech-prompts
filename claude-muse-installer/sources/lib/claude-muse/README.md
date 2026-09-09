@@ -66,22 +66,30 @@ description the model reads is unchanged and the tool still validates its own
 arguments when the call arrives.
 
 Dropping a constraint is safe because it widens the schema, and that is a
-property of what surrounds the constraint. Under `not` the polarity reverses:
-`{not: {pattern: ...}}` becomes `{not: {}}`, and an empty schema accepts
-everything, so the negation rejects everything. `if` flips which branch
-applies, and widening one `oneOf` branch can make two match and fail the whole.
-A pattern beneath any of those is refused locally with an explanation rather
-than dropped, because there dropping would reject arguments the tool declares
-valid.
+property of what surrounds the constraint rather than of the constraint. A few
+keywords take it away. Under `not` the polarity reverses: `{not: {pattern:
+...}}` becomes `{not: {}}`, an empty schema accepts everything, so the
+negation rejects everything. `if` flips which branch applies, widening one
+`oneOf` branch can make two match and fail the whole, `maxContains` turns a
+weaker `contains` into more matches than the cap allows, and a restrictive
+`unevaluatedProperties` or `unevaluatedItems` rejects whatever no keyword
+marked evaluated.
+
+A schema that needs a pattern removed and contains any of those anywhere is
+refused locally with an explanation, the way a web search domain filter is.
+The test is presence, not position, so it also refuses schemas where the
+removal would in fact have been safe. Deciding otherwise means resolving
+`$ref` and tracking which object each keyword governs, which is most of a JSON
+Schema evaluator, and a partial one is exactly what makes a transform look
+correct while it quietly narrows what a tool accepts.
 
 A `patternProperties` key is a regular expression as much as a `pattern` is,
 and the provider compiles it the same way. There the whole entry goes, because
 the key cannot be dropped without it: the names it matched become
-unconstrained, and are still accepted. The exception is a schema whose
-`additionalProperties` or `unevaluatedProperties` would then reject those
-names, since matching a `patternProperties` key is what exempted them. Removing the entry would narrow
-what the tool accepts rather than widen it, so that request is refused locally
-with an explanation instead, the way a web search domain filter is.
+unconstrained, and are still accepted. The exception is a sibling
+`additionalProperties` that would then reject those names, since matching a
+`patternProperties` key is what exempted them. Removing the entry would narrow
+what the tool accepts rather than widen it, so that request is refused too.
 
 Two things make this hard to recognise. The schema is behind a server-side
 feature gate, so the same CLI build fails on one machine and works on another,

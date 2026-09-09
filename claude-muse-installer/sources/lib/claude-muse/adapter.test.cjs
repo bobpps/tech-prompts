@@ -652,30 +652,49 @@ test('a pattern under an applicator that inverts is refused, not dropped', () =>
 });
 
 test('the applicators that preserve widening still drop', () => {
-  // `allOf`, `anyOf`, `then`, `else`, `contains` and `propertyNames` all get
-  // weaker when a subschema does, so the guarantee holds under them.
+  // `allOf`, `anyOf`, `contains` and `propertyNames` all get weaker when a
+  // subschema does, so the guarantee holds under them and the pattern goes.
   const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
     type: 'object',
     allOf: [{ pattern: '\\p{L}' }],
     anyOf: [{ pattern: '\\p{N}' }],
     contains: { pattern: '\\p{M}' },
     propertyNames: { pattern: '\\p{P}' },
-    if: { type: 'string' },
-    then: { pattern: '\\p{S}' },
-    else: { pattern: '\\p{Z}' },
+    $defs: { named: { pattern: '\\p{S}' } },
   } }] });
   const s = body.tools[0].input_schema;
-  for (const at of [s.allOf[0], s.anyOf[0], s.contains, s.propertyNames, s.then, s.else]) {
+  for (const at of [s.allOf[0], s.anyOf[0], s.contains, s.propertyNames, s.$defs.named]) {
     assert.equal(at.pattern, undefined);
   }
+});
+
+test('a keyword that removes the guarantee refuses the whole schema', () => {
+  // The check is presence, not position. A schema carrying one of these
+  // keywords anywhere is refused even where the pattern itself sits somewhere
+  // that would have been safe, because deciding otherwise means resolving
+  // references and tracking instance locations - most of a schema evaluator,
+  // and a partial one is what lets a transform narrow a schema quietly.
+  const refused = schema => assert.throws(
+    () => portableSchemas({ tools: [{ name: 'X', input_schema: schema }] }),
+    error => error instanceof UnsupportedRequest
+  );
+  // A definition cleaned where it is stored, applied under a negation.
+  refused({ $defs: { bad: { pattern: '\\p{L}+' } }, not: { $ref: '#/$defs/bad' } });
+  // `maxContains`: a weaker `contains` matches more elements than the cap.
+  refused({ type: 'array', contains: { pattern: '\\p{N}+' }, maxContains: 1 });
+  // The pattern is in a plainly monotonic place; the `if` elsewhere is enough.
+  refused({ type: 'object', if: { type: 'string' }, properties: { s: { pattern: '\\p{L}' } } });
+  // With nothing to remove, none of these keywords matter at all.
+  const untouched = { type: 'object', not: { pattern: '^[a-z]+$' }, maxContains: 1 };
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'X', input_schema: untouched }] }).tools[0].input_schema, untouched);
 });
 
 test('a patternProperties entry sealed by unevaluatedProperties is refused', () => {
   // `unevaluatedProperties: false` rejects what no keyword marked evaluated,
   // and matching a `patternProperties` key is what marked those names. Delete
   // the entry and they become unevaluated, so the schema narrows exactly as it
-  // does under a restrictive `additionalProperties` - and this one reaches
-  // down from an enclosing schema as well.
+  // does under a restrictive `additionalProperties`. Only a restrictive one
+  // counts: `true` rejects nothing and leaves the removal a widening.
   const sealed = { tools: [{ name: 'X', input_schema: {
     type: 'object',
     unevaluatedProperties: false,
