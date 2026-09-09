@@ -232,14 +232,20 @@ Sources are LF only. `build.cjs` refuses one carrying a carriage return and `che
 prompt that carries one, because a CR copied into the POSIX shim would leave `#!/usr/bin/env bash`
 followed by a carriage return, which is not a shebang.
 
-`sources/` mirrors the installed tree minus the leading dots, and every file in it is
-byte-identical to what an install writes. A machine whose adapter has stopped working is therefore
-repaired by copying one file over its twin, with no reinstall:
+`sources/` mirrors the installed tree minus the leading dots, so every file sits where its
+installed twin does. Six of the eight are the bytes an install writes and can be copied straight
+over it. Two are not, and both differ by design: `provider.env` gains the key you paste into it,
+and `claude-muse.cmd` is written with CRLF, which the prompt itself cannot carry. So a machine
+whose adapter has stopped working is repaired without a reinstall:
 
 ```text
 cp claude-muse-installer/sources/lib/claude-muse/adapter.cjs ~/.local/lib/claude-muse/
 node --test ~/.local/lib/claude-muse/*.test.cjs
 ```
+
+Replacing `claude-muse.cmd` on Windows means converting it to CRLF on the way; a batch shim with
+LF endings is not reliably run by `cmd.exe`. Never overwrite `provider.env` from here — it would
+take your key with it.
 
 The suites also run straight from the repository, which is the fast loop while changing the
 adapter:
