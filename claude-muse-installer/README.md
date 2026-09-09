@@ -233,19 +233,26 @@ prompt that carries one, because a CR copied into the POSIX shim would leave `#!
 followed by a carriage return, which is not a shebang.
 
 `sources/` mirrors the installed tree minus the leading dots, so every file sits where its
-installed twin does. Six of the eight are the bytes an install writes and can be copied straight
-over it. Two are not, and both differ by design: `provider.env` gains the key you paste into it,
-and `claude-muse.cmd` is written with CRLF, which the prompt itself cannot carry. So a machine
-whose adapter has stopped working is repaired without a reinstall:
+installed twin does. The launcher, the adapter, their two suites and the installed README are the
+bytes an install writes, and a machine whose adapter has stopped working is repaired by copying
+one over its twin, with no reinstall:
 
 ```text
 cp claude-muse-installer/sources/lib/claude-muse/adapter.cjs ~/.local/lib/claude-muse/
 node --test ~/.local/lib/claude-muse/*.test.cjs
 ```
 
-Replacing `claude-muse.cmd` on Windows means converting it to CRLF on the way; a batch shim with
-LF endings is not reliably run by `cmd.exe`. Never overwrite `provider.env` from here — it would
-take your key with it.
+The other three are transformed on the way in, each for a reason, and none of them should be
+copied blind:
+
+- `provider.env` gains the key you paste into it. Never overwrite it from here.
+- `claude-muse.cmd` is written with CRLF, which the prompt itself cannot carry. Convert it on the
+  way if you replace it on Windows: a batch shim with LF endings is not reliably run by
+  `cmd.exe`.
+- `claude-muse`, the POSIX shim, keeps the source verbatim on Linux, macOS and WSL. Under Git Bash
+  its last line is rewritten to resolve the home through Node when the shell's `$HOME` and
+  `os.homedir()` disagree, so check that line before replacing it there — the stock line would
+  send the launcher looking for `provider.env` in a tree the install never wrote to.
 
 The suites also run straight from the repository, which is the fast loop while changing the
 adapter:
