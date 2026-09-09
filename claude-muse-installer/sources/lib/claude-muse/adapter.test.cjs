@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -468,6 +468,70 @@ test('web_search keeps only the fields Meta accepts; domain filters are refused'
       error => error instanceof UnsupportedRequest && error.message.includes(field)
     );
   }
+});
+
+test('a Unicode-property pattern is dropped from a tool schema, and nothing else is', () => {
+  // The pattern Claude Code 2.1.266 puts on Artifact's `field` argument, taken
+  // off the wire. In the CLI it is a regex literal carrying the `u` flag that
+  // gives \p{Cc} its meaning; a JSON Schema `pattern` is a bare string with no
+  // flags, so what reaches the provider is a regex it refuses to compile.
+  const artifact = '^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}"\\\\./[\\]]{1,200}$';
+  const plain = '^[a-z0-9_-]+$';
+  const body = portableSchemas({
+    tools: [
+      { name: 'Artifact', input_schema: { type: 'object', $defs: { id: { type: 'string', pattern: '^\\p{Nd}{4}$' } }, properties: {
+        field: { type: 'string', description: 'kept', pattern: artifact },
+        collection: { type: 'string', pattern: plain },
+        doc: { anyOf: [{ type: 'string', pattern: '\\p{L}+' }, { type: 'string', pattern: plain }] },
+        rows: { items: { type: 'string', pattern: '\\P{N}' } },
+      } } },
+      { name: 'Read' },
+      { type: 'web_search_20250305', name: 'web_search' },
+    ],
+    messages: [{ content: [{ type: 'tool_use', name: 'Artifact', input: { pattern: '\\p{L}' } }] }],
+  });
+  const schema = body.tools[0].input_schema;
+  assert.ok(!('pattern' in schema.properties.field));
+  assert.equal(schema.properties.doc.anyOf[0].pattern, undefined);
+  assert.equal(schema.properties.rows.items.pattern, undefined);
+  assert.equal(schema.$defs.id.pattern, undefined);
+  // A pattern the provider can compile is a useful constraint and stays.
+  assert.equal(schema.properties.collection.pattern, plain);
+  assert.equal(schema.properties.doc.anyOf[1].pattern, plain);
+  // Only the constraint goes. The property it constrained, and everything the
+  // model reads to decide how to call the tool, are left exactly as they were.
+  assert.equal(schema.properties.field.type, 'string');
+  assert.equal(schema.properties.field.description, 'kept');
+  // Tool definitions only. A past call's arguments are the conversation, and a
+  // tool is free to take an argument of its own called `pattern`.
+  assert.equal(body.messages[0].content[0].input.pattern, '\\p{L}');
+});
+
+test('a pattern that is a value rather than a constraint is left alone', () => {
+  // `const`, `default`, `enum` and `examples` hold arbitrary JSON, not
+  // subschemas. An object inside one of them may have a member named `pattern`,
+  // and deleting it would change a value the tool receives instead of a
+  // constraint the provider enforces.
+  const body = portableSchemas({ tools: [{ name: 'Grep', input_schema: {
+    type: 'object',
+    properties: {
+      rule: { type: 'object', default: { pattern: '\\p{L}+' }, const: { pattern: '\\p{M}' } },
+      mode: { enum: [{ pattern: '\\p{N}' }], examples: [{ pattern: '\\p{L}' }] },
+    },
+  } }] });
+  const props = body.tools[0].input_schema.properties;
+  assert.equal(props.rule.default.pattern, '\\p{L}+');
+  assert.equal(props.rule.const.pattern, '\\p{M}');
+  assert.equal(props.mode.enum[0].pattern, '\\p{N}');
+  assert.equal(props.mode.examples[0].pattern, '\\p{L}');
+});
+
+test('a body with no tools, and a tool with no schema, do not throw', () => {
+  assert.deepEqual(portableSchemas({}), {});
+  assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'Read' }] }), { tools: [{ name: 'Read' }] });
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: null }] }).tools[0].input_schema, null);
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: { pattern: 5 } }] }).tools[0].input_schema.pattern, 5);
 });
 
 test('a name claimed by one request does not follow the next one', async () => {

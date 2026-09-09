@@ -45,6 +45,39 @@ your Claude Code settings, or turn the WebSearch tool off.
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
 
+## Regex patterns in tool schemas
+
+Meta compiles every JSON Schema `pattern` a tool declares with a strict
+ECMA-262 validator, and refuses the whole request when one of them does not
+parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+property escapes, and in the CLI they sit in a regex literal carrying the `u`
+flag that gives them a meaning. A `pattern` is a bare string and carries no
+flags, so what arrives upstream is a regex the provider cannot compile.
+
+One bad schema among the whole set is enough to end every turn, so the symptom
+is that nothing works at all rather than that one tool is broken. The adapter
+removes any `pattern` containing `\p{` or `\P{` from `tools[].input_schema`,
+and leaves every other pattern in place. Only the constraint goes: `pattern`
+tells the provider what to reject, not the model what to send, so the tool
+description the model reads is unchanged and the tool still validates its own
+arguments when the call arrives.
+
+Two things make this hard to recognise. The schema is behind a server-side
+feature gate, so the same CLI build fails on one machine and works on another,
+and the set of schemas sent can change with no update at all. And Claude Code
+does not send the Artifact tool on a `-p` run, so a print-mode smoke test
+passes while every interactive session dies. To see the failure on purpose, set
+`CLAUDE_CODE_ARTIFACT=1` on a `-p` run.
+
+If a future schema breaks in a way this transform does not cover, setting
+`CLAUDE_CODE_ARTIFACT_DB_STR_REPLACE` to any value at all turns the offending
+operation off without touching the adapter. It reads as a disable whatever it
+is set to, including `true`, because the CLI compares the variable against the
+boolean `true` and an environment variable is always a string. This is a
+stopgap: it gives up a working feature to route around one bad pattern, and the
+transform above is what closes the class.
+
 ## Auto mode
 
 Claude Code's auto mode asks the model whether a tool call is safe before

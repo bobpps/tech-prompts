@@ -275,6 +275,53 @@ function webSearchTools(body) {
   return body;
 }
 
+// Meta compiles every JSON Schema `pattern` a tool declares with a strict
+// ECMA-262 validator, and refuses the whole request when one of them does not
+// parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+// constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+// property escapes, and in the CLI they sit in a regex literal carrying the
+// `u` flag that gives them a meaning. A `pattern` is a bare string and carries
+// no flags, so what arrives upstream is a regex the provider cannot compile.
+//
+// One bad schema among the whole set kills every call in the session, so the
+// visible symptom is that the model is unavailable rather than that one tool is
+// broken. The schema is also behind a server-side feature gate, which is why
+// the same CLI build fails on one machine and works on another, and why the
+// set of schemas sent can change without an update. Matching the class - a
+// Unicode property escape anywhere in a pattern - rather than this one regex
+// is what keeps the next gated schema from reopening this.
+//
+// Only the constraint is removed, never the property it constrained. `pattern`
+// tells the provider what to reject; it is not part of what the model reads to
+// decide how to call the tool. Dropping it widens what the request may carry
+// and changes nothing the model is shown, and the tool still validates its own
+// arguments when the call arrives.
+//
+// `const`, `default`, `enum` and `examples` hold arbitrary JSON rather than
+// subschemas, so a member named `pattern` inside one of them is a value the
+// tool receives, not a constraint, and is left alone.
+const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
+
+function portableSchemas(body) {
+  for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);
+  return body;
+}
+
+function dropUnicodePatterns(node) {
+  if (Array.isArray(node)) {
+    for (const item of node) dropUnicodePatterns(item);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'pattern' && typeof value === 'string') {
+      if (/\\[pP]\{/.test(value)) delete node[key];
+    } else if (!SCHEMA_VALUES.includes(key)) {
+      dropUnicodePatterns(value);
+    }
+  }
+}
+
 // Meta rejects `stop_sequences` outright with HTTP 400.
 //
 // Claude Code sends it on the auto-mode safety classifier call - the request
@@ -425,7 +472,7 @@ async function startProxy(upstream, token, idleSeconds) {
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
         });
-        payload = JSON.stringify(stopSequences(plainCacheControl(webSearchTools(names.request(parsed)))));
+        payload = JSON.stringify(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed))))));
       }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
@@ -504,4 +551,4 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };

@@ -1039,6 +1039,53 @@ function webSearchTools(body) {
   return body;
 }
 
+// Meta compiles every JSON Schema `pattern` a tool declares with a strict
+// ECMA-262 validator, and refuses the whole request when one of them does not
+// parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+// constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+// property escapes, and in the CLI they sit in a regex literal carrying the
+// `u` flag that gives them a meaning. A `pattern` is a bare string and carries
+// no flags, so what arrives upstream is a regex the provider cannot compile.
+//
+// One bad schema among the whole set kills every call in the session, so the
+// visible symptom is that the model is unavailable rather than that one tool is
+// broken. The schema is also behind a server-side feature gate, which is why
+// the same CLI build fails on one machine and works on another, and why the
+// set of schemas sent can change without an update. Matching the class - a
+// Unicode property escape anywhere in a pattern - rather than this one regex
+// is what keeps the next gated schema from reopening this.
+//
+// Only the constraint is removed, never the property it constrained. `pattern`
+// tells the provider what to reject; it is not part of what the model reads to
+// decide how to call the tool. Dropping it widens what the request may carry
+// and changes nothing the model is shown, and the tool still validates its own
+// arguments when the call arrives.
+//
+// `const`, `default`, `enum` and `examples` hold arbitrary JSON rather than
+// subschemas, so a member named `pattern` inside one of them is a value the
+// tool receives, not a constraint, and is left alone.
+const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
+
+function portableSchemas(body) {
+  for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);
+  return body;
+}
+
+function dropUnicodePatterns(node) {
+  if (Array.isArray(node)) {
+    for (const item of node) dropUnicodePatterns(item);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'pattern' && typeof value === 'string') {
+      if (/\\[pP]\{/.test(value)) delete node[key];
+    } else if (!SCHEMA_VALUES.includes(key)) {
+      dropUnicodePatterns(value);
+    }
+  }
+}
+
 // Meta rejects `stop_sequences` outright with HTTP 400.
 //
 // Claude Code sends it on the auto-mode safety classifier call - the request
@@ -1189,7 +1236,7 @@ async function startProxy(upstream, token, idleSeconds) {
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
         });
-        payload = JSON.stringify(stopSequences(plainCacheControl(webSearchTools(names.request(parsed)))));
+        payload = JSON.stringify(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed))))));
       }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
@@ -1268,7 +1315,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -1640,7 +1687,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -2104,6 +2151,70 @@ test('web_search keeps only the fields Meta accepts; domain filters are refused'
   }
 });
 
+test('a Unicode-property pattern is dropped from a tool schema, and nothing else is', () => {
+  // The pattern Claude Code 2.1.266 puts on Artifact's `field` argument, taken
+  // off the wire. In the CLI it is a regex literal carrying the `u` flag that
+  // gives \p{Cc} its meaning; a JSON Schema `pattern` is a bare string with no
+  // flags, so what reaches the provider is a regex it refuses to compile.
+  const artifact = '^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}"\\\\./[\\]]{1,200}$';
+  const plain = '^[a-z0-9_-]+$';
+  const body = portableSchemas({
+    tools: [
+      { name: 'Artifact', input_schema: { type: 'object', $defs: { id: { type: 'string', pattern: '^\\p{Nd}{4}$' } }, properties: {
+        field: { type: 'string', description: 'kept', pattern: artifact },
+        collection: { type: 'string', pattern: plain },
+        doc: { anyOf: [{ type: 'string', pattern: '\\p{L}+' }, { type: 'string', pattern: plain }] },
+        rows: { items: { type: 'string', pattern: '\\P{N}' } },
+      } } },
+      { name: 'Read' },
+      { type: 'web_search_20250305', name: 'web_search' },
+    ],
+    messages: [{ content: [{ type: 'tool_use', name: 'Artifact', input: { pattern: '\\p{L}' } }] }],
+  });
+  const schema = body.tools[0].input_schema;
+  assert.ok(!('pattern' in schema.properties.field));
+  assert.equal(schema.properties.doc.anyOf[0].pattern, undefined);
+  assert.equal(schema.properties.rows.items.pattern, undefined);
+  assert.equal(schema.$defs.id.pattern, undefined);
+  // A pattern the provider can compile is a useful constraint and stays.
+  assert.equal(schema.properties.collection.pattern, plain);
+  assert.equal(schema.properties.doc.anyOf[1].pattern, plain);
+  // Only the constraint goes. The property it constrained, and everything the
+  // model reads to decide how to call the tool, are left exactly as they were.
+  assert.equal(schema.properties.field.type, 'string');
+  assert.equal(schema.properties.field.description, 'kept');
+  // Tool definitions only. A past call's arguments are the conversation, and a
+  // tool is free to take an argument of its own called `pattern`.
+  assert.equal(body.messages[0].content[0].input.pattern, '\\p{L}');
+});
+
+test('a pattern that is a value rather than a constraint is left alone', () => {
+  // `const`, `default`, `enum` and `examples` hold arbitrary JSON, not
+  // subschemas. An object inside one of them may have a member named `pattern`,
+  // and deleting it would change a value the tool receives instead of a
+  // constraint the provider enforces.
+  const body = portableSchemas({ tools: [{ name: 'Grep', input_schema: {
+    type: 'object',
+    properties: {
+      rule: { type: 'object', default: { pattern: '\\p{L}+' }, const: { pattern: '\\p{M}' } },
+      mode: { enum: [{ pattern: '\\p{N}' }], examples: [{ pattern: '\\p{L}' }] },
+    },
+  } }] });
+  const props = body.tools[0].input_schema.properties;
+  assert.equal(props.rule.default.pattern, '\\p{L}+');
+  assert.equal(props.rule.const.pattern, '\\p{M}');
+  assert.equal(props.mode.enum[0].pattern, '\\p{N}');
+  assert.equal(props.mode.examples[0].pattern, '\\p{L}');
+});
+
+test('a body with no tools, and a tool with no schema, do not throw', () => {
+  assert.deepEqual(portableSchemas({}), {});
+  assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
+  assert.deepEqual(portableSchemas({ tools: [{ name: 'Read' }] }), { tools: [{ name: 'Read' }] });
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: null }] }).tools[0].input_schema, null);
+  assert.equal(portableSchemas({ tools: [{ name: 'R', input_schema: { pattern: 5 } }] }).tools[0].input_schema.pattern, 5);
+});
+
 test('a name claimed by one request does not follow the next one', async () => {
   // The upstream echoes back the tool names it was given, so the test can see
   // what actually left the adapter.
@@ -2257,6 +2368,39 @@ your Claude Code settings, or turn the WebSearch tool off.
 
 Page fetching happens inside Meta's own search tool. The separate
 `web_fetch_20250910` tool type is not supported by the provider.
+
+## Regex patterns in tool schemas
+
+Meta compiles every JSON Schema `pattern` a tool declares with a strict
+ECMA-262 validator, and refuses the whole request when one of them does not
+parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
+constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
+property escapes, and in the CLI they sit in a regex literal carrying the `u`
+flag that gives them a meaning. A `pattern` is a bare string and carries no
+flags, so what arrives upstream is a regex the provider cannot compile.
+
+One bad schema among the whole set is enough to end every turn, so the symptom
+is that nothing works at all rather than that one tool is broken. The adapter
+removes any `pattern` containing `\p{` or `\P{` from `tools[].input_schema`,
+and leaves every other pattern in place. Only the constraint goes: `pattern`
+tells the provider what to reject, not the model what to send, so the tool
+description the model reads is unchanged and the tool still validates its own
+arguments when the call arrives.
+
+Two things make this hard to recognise. The schema is behind a server-side
+feature gate, so the same CLI build fails on one machine and works on another,
+and the set of schemas sent can change with no update at all. And Claude Code
+does not send the Artifact tool on a `-p` run, so a print-mode smoke test
+passes while every interactive session dies. To see the failure on purpose, set
+`CLAUDE_CODE_ARTIFACT=1` on a `-p` run.
+
+If a future schema breaks in a way this transform does not cover, setting
+`CLAUDE_CODE_ARTIFACT_DB_STR_REPLACE` to any value at all turns the offending
+operation off without touching the adapter. It reads as a disable whatever it
+is set to, including `true`, because the CLI compares the variable against the
+boolean `true` and an environment variable is always a string. This is a
+stopgap: it gives up a working feature to route around one bad pattern, and the
+transform above is what closes the class.
 
 ## Auto mode
 
@@ -2591,8 +2735,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-seven offline tests in total: twenty in `adapter.test.cjs` and
-seventeen in `launcher.test.cjs`. All thirty-seven must pass on both platforms;
+There are forty offline tests in total: twenty-three in `adapter.test.cjs` and
+seventeen in `launcher.test.cjs`. All forty must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -2716,7 +2860,21 @@ repository. Clean up only the exact temporary directory created for this test.
 
 On every platform, confirm by hand that an interactive `claude-muse` session
 starts, sends one real message and gets an answer. A `-p` run does not exercise
-the same prompt-cache path, so it cannot prove the session will work. On native
+the same prompt-cache path, so it cannot prove the session will work. It also
+sends a different set of tools: the Artifact tool is absent from a print-mode
+run, so a tool schema the provider refuses can end every interactive turn while
+every `-p` check above stays green. Run one more print-mode check with that
+tool forced in, and require the same answer:
+
+```text
+CLAUDE_CODE_ARTIFACT=1 claude-muse -p 'Reply with exactly: MUSE WORKS' \
+  --no-session-persistence --output-format json
+```
+
+A 400 reading `Invalid JSON schema` and quoting a regular expression here means
+the adapter is not stripping the patterns Meta cannot compile; fix that rather
+than pinning or downgrading Claude Code, which only moves the failure to the
+next release. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run

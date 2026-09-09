@@ -447,8 +447,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are thirty-seven offline tests in total: twenty in `adapter.test.cjs` and
-seventeen in `launcher.test.cjs`. All thirty-seven must pass on both platforms;
+There are forty offline tests in total: twenty-three in `adapter.test.cjs` and
+seventeen in `launcher.test.cjs`. All forty must pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
@@ -572,7 +572,21 @@ repository. Clean up only the exact temporary directory created for this test.
 
 On every platform, confirm by hand that an interactive `claude-muse` session
 starts, sends one real message and gets an answer. A `-p` run does not exercise
-the same prompt-cache path, so it cannot prove the session will work. On native
+the same prompt-cache path, so it cannot prove the session will work. It also
+sends a different set of tools: the Artifact tool is absent from a print-mode
+run, so a tool schema the provider refuses can end every interactive turn while
+every `-p` check above stays green. Run one more print-mode check with that
+tool forced in, and require the same answer:
+
+```text
+CLAUDE_CODE_ARTIFACT=1 claude-muse -p 'Reply with exactly: MUSE WORKS' \
+  --no-session-persistence --output-format json
+```
+
+A 400 reading `Invalid JSON schema` and quoting a regular expression here means
+the adapter is not stripping the patterns Meta cannot compile; fix that rather
+than pinning or downgrading Claude Code, which only moves the failure to the
+next release. On native
 Windows this also confirms that the terminal interface renders through the
 `.cmd` shim, accepts a keystroke, and exits cleanly with `/exit`. Automated `-p` runs do not prove that the terminal
 interface works through the `.cmd` shim. If Ctrl+C during a non-interactive run
