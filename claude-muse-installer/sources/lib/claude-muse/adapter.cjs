@@ -343,6 +343,34 @@ function portableSchemas(body) {
   return body;
 }
 
+// A `patternProperties` key is a regular expression as much as a `pattern` is,
+// and the provider compiles it the same way, so a schema can be refused for a
+// key alone. Only this map is keyed by a regex; `properties`, `$defs` and the
+// rest are keyed by names.
+//
+// Removing the whole entry is what widens here. The names it matched become
+// unconstrained, and they are still accepted - unless a sibling
+// `additionalProperties` would now reject them, because a name matching any
+// `patternProperties` key is exempt from it. Then removal is a narrowing:
+// arguments the tool declared valid would start being refused. That is a
+// change to what the tool accepts rather than to what the provider will
+// compile, so it is refused here with an explanation instead, the way a
+// web_search domain filter is.
+function dropUnicodeKeys(schema, map) {
+  for (const key of Object.keys(map)) {
+    if (!UNICODE_PROPERTY.test(key)) continue;
+    const additional = schema.additionalProperties;
+    if (additional !== undefined && additional !== true) {
+      throw new UnsupportedRequest(
+        'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
+        'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
+        'property escape from that tool schema, or turn the tool off.'
+      );
+    }
+    delete map[key];
+  }
+}
+
 // `node` is a subschema, or an array of them. Anything reached from here is
 // read as a schema unless one of the lists above says otherwise.
 function dropUnicodePatterns(node) {
@@ -357,7 +385,10 @@ function dropUnicodePatterns(node) {
     } else if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) {
       continue;
     } else if (SCHEMA_MAPS.includes(key)) {
-      if (value && typeof value === 'object') for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+      if (value && typeof value === 'object') {
+        if (key === 'patternProperties') dropUnicodeKeys(node, value);
+        for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+      }
     } else {
       dropUnicodePatterns(value);
     }

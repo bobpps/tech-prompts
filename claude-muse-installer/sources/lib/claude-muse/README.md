@@ -65,6 +65,15 @@ tells the provider what to reject, not the model what to send, so the tool
 description the model reads is unchanged and the tool still validates its own
 arguments when the call arrives.
 
+A `patternProperties` key is a regular expression as much as a `pattern` is,
+and the provider compiles it the same way. There the whole entry goes, because
+the key cannot be dropped without it: the names it matched become
+unconstrained, and are still accepted. The exception is a schema whose
+`additionalProperties` would then reject those names, since matching a
+`patternProperties` key is what exempted them. Removing the entry would narrow
+what the tool accepts rather than widen it, so that request is refused locally
+with an explanation instead, the way a web search domain filter is.
+
 Two things make this hard to recognise. The schema is behind a server-side
 feature gate, so the same CLI build fails on one machine and works on another,
 and the set of schemas sent can change with no update at all. And Claude Code

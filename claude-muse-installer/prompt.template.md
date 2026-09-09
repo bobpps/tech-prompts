@@ -483,8 +483,9 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are forty-two offline tests in total: twenty-five in `adapter.test.cjs`
-and seventeen in `launcher.test.cjs`. All forty-two must pass on both platforms;
+There are forty-four offline tests in total: twenty-seven in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-four must
+pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 

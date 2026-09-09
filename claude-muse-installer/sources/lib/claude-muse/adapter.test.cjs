@@ -584,6 +584,50 @@ test('an unknown keyword is read as a schema; a named annotation is not', () => 
   assert.equal(schema.properties.doc.contentSchema.pattern, undefined);
 });
 
+test('a patternProperties key is a regex too, and is dropped or refused', () => {
+  // The key of a `patternProperties` entry is itself a regular expression the
+  // provider compiles, so the same escapes are fatal there and walking only
+  // the values would leave the request refused for the same reason.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    patternProperties: {
+      '^\\p{L}+$': { type: 'string', pattern: '\\p{N}' },
+      '^[a-z]+$': { type: 'string', pattern: '\\p{M}' },
+    },
+  } }] });
+  const map = body.tools[0].input_schema.patternProperties;
+  // The entry goes with its key: what it constrained becomes unconstrained,
+  // which is a widening, and the properties it matched are still accepted.
+  assert.deepEqual(Object.keys(map), ['^[a-z]+$']);
+  // The surviving entry is still a schema and is still cleaned.
+  assert.equal(map['^[a-z]+$'].pattern, undefined);
+  assert.equal(map['^[a-z]+$'].type, 'string');
+});
+
+test('a patternProperties key cannot be dropped where additionalProperties would reject it', () => {
+  // Removing the entry stops exempting the names it matched, so a restrictive
+  // `additionalProperties` turns the widening into a narrowing: arguments the
+  // tool declared valid would start being rejected. That is a change to what
+  // the tool accepts, and it is not the adapter's to make silently.
+  for (const additional of [false, { type: 'string' }]) {
+    assert.throws(
+      () => portableSchemas({ tools: [{ name: 'X', input_schema: {
+        type: 'object',
+        additionalProperties: additional,
+        patternProperties: { '^\\p{L}+$': { type: 'string' } },
+      } }] }),
+      error => error instanceof UnsupportedRequest && error.message.includes('\\p{L}')
+    );
+  }
+  // An open schema is the ordinary case and is widened rather than refused.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    additionalProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });

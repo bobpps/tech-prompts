@@ -5,7 +5,7 @@ API (`muse-spark-1.3-contributor`), on Linux, macOS, WSL, Git Bash **and** nativ
 verifies the installation end to end.
 
 Paste [`prompt.md`](prompt.md) into Claude Code on the machine you want to set up. The agent
-detects the platform once and follows only that branch; it writes the files, runs forty-two offline
+detects the platform once and follows only that branch; it writes the files, runs forty-four offline
 tests, and finishes with live smoke tests. It does not just print commands for you to run.
 
 ## Requirements
@@ -24,7 +24,7 @@ tests, and finishes with live smoke tests. It does not just print commands for y
 ~/.local/lib/claude-muse/launcher.cjs        config, environment, process, platform decisions
 ~/.local/lib/claude-muse/adapter.cjs         loopback proxy and tool-name aliasing
 ~/.local/lib/claude-muse/launcher.test.cjs   seventeen offline tests
-~/.local/lib/claude-muse/adapter.test.cjs    twenty-five offline tests
+~/.local/lib/claude-muse/adapter.test.cjs    twenty-seven offline tests
 ~/.local/lib/claude-muse/README.md           why each setting is what it is
 ~/.config/claude-muse/provider.env   base URL, model, effort, idle timeout — and your key
 ```
@@ -47,7 +47,7 @@ anticipated:
 | `cache_control` carrying `ttl` or `scope` | `cache_control.ttl: 1h is not supported` | Reduces it to the plain `{"type":"ephemeral"}` form |
 | `max_uses` on `web_search_20250305` | `web_search field max_uses is not supported` | Drops the field; the provider applies its own cap |
 | `stop_sequences` on the auto-mode classifier | `stop_sequences is not supported` | Drops the field |
-| A tool schema `pattern` written with `\p{...}` | `Invalid JSON schema: "..." is not a "regex"` | Drops that one constraint from the schema |
+| A tool schema `pattern` written with `\p{...}` | `Invalid JSON schema: "..." is not a "regex"` | Drops that one constraint; refuses locally in the one case where dropping it would narrow the schema |
 
 The last two rows are worth spelling out, because neither symptom names anything. Claude Code
 reports the `stop_sequences` 400 as *"the model is temporarily unavailable"*, so auto mode stops

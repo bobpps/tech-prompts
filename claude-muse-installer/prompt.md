@@ -1143,6 +1143,34 @@ function portableSchemas(body) {
   return body;
 }
 
+// A `patternProperties` key is a regular expression as much as a `pattern` is,
+// and the provider compiles it the same way, so a schema can be refused for a
+// key alone. Only this map is keyed by a regex; `properties`, `$defs` and the
+// rest are keyed by names.
+//
+// Removing the whole entry is what widens here. The names it matched become
+// unconstrained, and they are still accepted - unless a sibling
+// `additionalProperties` would now reject them, because a name matching any
+// `patternProperties` key is exempt from it. Then removal is a narrowing:
+// arguments the tool declared valid would start being refused. That is a
+// change to what the tool accepts rather than to what the provider will
+// compile, so it is refused here with an explanation instead, the way a
+// web_search domain filter is.
+function dropUnicodeKeys(schema, map) {
+  for (const key of Object.keys(map)) {
+    if (!UNICODE_PROPERTY.test(key)) continue;
+    const additional = schema.additionalProperties;
+    if (additional !== undefined && additional !== true) {
+      throw new UnsupportedRequest(
+        'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
+        'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
+        'property escape from that tool schema, or turn the tool off.'
+      );
+    }
+    delete map[key];
+  }
+}
+
 // `node` is a subschema, or an array of them. Anything reached from here is
 // read as a schema unless one of the lists above says otherwise.
 function dropUnicodePatterns(node) {
@@ -1157,7 +1185,10 @@ function dropUnicodePatterns(node) {
     } else if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) {
       continue;
     } else if (SCHEMA_MAPS.includes(key)) {
-      if (value && typeof value === 'object') for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+      if (value && typeof value === 'object') {
+        if (key === 'patternProperties') dropUnicodeKeys(node, value);
+        for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+      }
     } else {
       dropUnicodePatterns(value);
     }
@@ -2343,6 +2374,50 @@ test('an unknown keyword is read as a schema; a named annotation is not', () => 
   assert.equal(schema.properties.doc.contentSchema.pattern, undefined);
 });
 
+test('a patternProperties key is a regex too, and is dropped or refused', () => {
+  // The key of a `patternProperties` entry is itself a regular expression the
+  // provider compiles, so the same escapes are fatal there and walking only
+  // the values would leave the request refused for the same reason.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    patternProperties: {
+      '^\\p{L}+$': { type: 'string', pattern: '\\p{N}' },
+      '^[a-z]+$': { type: 'string', pattern: '\\p{M}' },
+    },
+  } }] });
+  const map = body.tools[0].input_schema.patternProperties;
+  // The entry goes with its key: what it constrained becomes unconstrained,
+  // which is a widening, and the properties it matched are still accepted.
+  assert.deepEqual(Object.keys(map), ['^[a-z]+$']);
+  // The surviving entry is still a schema and is still cleaned.
+  assert.equal(map['^[a-z]+$'].pattern, undefined);
+  assert.equal(map['^[a-z]+$'].type, 'string');
+});
+
+test('a patternProperties key cannot be dropped where additionalProperties would reject it', () => {
+  // Removing the entry stops exempting the names it matched, so a restrictive
+  // `additionalProperties` turns the widening into a narrowing: arguments the
+  // tool declared valid would start being rejected. That is a change to what
+  // the tool accepts, and it is not the adapter's to make silently.
+  for (const additional of [false, { type: 'string' }]) {
+    assert.throws(
+      () => portableSchemas({ tools: [{ name: 'X', input_schema: {
+        type: 'object',
+        additionalProperties: additional,
+        patternProperties: { '^\\p{L}+$': { type: 'string' } },
+      } }] }),
+      error => error instanceof UnsupportedRequest && error.message.includes('\\p{L}')
+    );
+  }
+  // An open schema is the ordinary case and is widened rather than refused.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    additionalProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
@@ -2524,6 +2599,15 @@ and leaves every other pattern in place. Only the constraint goes: `pattern`
 tells the provider what to reject, not the model what to send, so the tool
 description the model reads is unchanged and the tool still validates its own
 arguments when the call arrives.
+
+A `patternProperties` key is a regular expression as much as a `pattern` is,
+and the provider compiles it the same way. There the whole entry goes, because
+the key cannot be dropped without it: the names it matched become
+unconstrained, and are still accepted. The exception is a schema whose
+`additionalProperties` would then reject those names, since matching a
+`patternProperties` key is what exempted them. Removing the entry would narrow
+what the tool accepts rather than widen it, so that request is refused locally
+with an explanation instead, the way a web search domain filter is.
 
 Two things make this hard to recognise. The schema is behind a server-side
 feature gate, so the same CLI build fails on one machine and works on another,
@@ -2873,8 +2957,9 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are forty-two offline tests in total: twenty-five in `adapter.test.cjs`
-and seventeen in `launcher.test.cjs`. All forty-two must pass on both platforms;
+There are forty-four offline tests in total: twenty-seven in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-four must
+pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
 
