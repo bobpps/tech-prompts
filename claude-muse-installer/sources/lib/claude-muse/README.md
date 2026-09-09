@@ -65,12 +65,21 @@ tells the provider what to reject, not the model what to send, so the tool
 description the model reads is unchanged and the tool still validates its own
 arguments when the call arrives.
 
+Dropping a constraint is safe because it widens the schema, and that is a
+property of what surrounds the constraint. Under `not` the polarity reverses:
+`{not: {pattern: ...}}` becomes `{not: {}}`, and an empty schema accepts
+everything, so the negation rejects everything. `if` flips which branch
+applies, and widening one `oneOf` branch can make two match and fail the whole.
+A pattern beneath any of those is refused locally with an explanation rather
+than dropped, because there dropping would reject arguments the tool declares
+valid.
+
 A `patternProperties` key is a regular expression as much as a `pattern` is,
 and the provider compiles it the same way. There the whole entry goes, because
 the key cannot be dropped without it: the names it matched become
 unconstrained, and are still accepted. The exception is a schema whose
-`additionalProperties` would then reject those names, since matching a
-`patternProperties` key is what exempted them. Removing the entry would narrow
+`additionalProperties` or `unevaluatedProperties` would then reject those
+names, since matching a `patternProperties` key is what exempted them. Removing the entry would narrow
 what the tool accepts rather than widen it, so that request is refused locally
 with an explanation instead, the way a web search domain filter is.
 

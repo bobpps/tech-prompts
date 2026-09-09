@@ -628,6 +628,77 @@ test('a patternProperties key cannot be dropped where additionalProperties would
   assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
 });
 
+test('a pattern under an applicator that inverts is refused, not dropped', () => {
+  // Dropping a constraint widens the schema it sits in, and that is what makes
+  // dropping safe - but only where the schema around it is monotonic. Under
+  // `not` the polarity reverses: `{not: {pattern: ...}}` becomes `{not: {}}`,
+  // and the empty schema accepts everything, so the negation rejects
+  // everything. `if` flips which branch applies, and widening one `oneOf`
+  // branch can make two match and fail the whole. Those cannot be widened, so
+  // they are refused with an explanation rather than silently narrowed.
+  const under = shape => ({ tools: [{ name: 'X', input_schema: { type: 'object', properties: { s: shape } } }] });
+  for (const shape of [
+    { not: { pattern: '\\p{L}+' } },
+    { if: { pattern: '\\p{L}+' }, then: { minLength: 2 } },
+    { oneOf: [{ pattern: '\\p{L}+' }, { type: 'number' }] },
+    // Depth does not restore the guarantee: still inside the negation.
+    { not: { properties: { t: { items: { pattern: '\\p{L}+' } } } } },
+  ]) {
+    assert.throws(
+      () => portableSchemas(under(shape)),
+      error => error instanceof UnsupportedRequest && /not|if|oneOf/.test(error.message)
+    );
+  }
+});
+
+test('the applicators that preserve widening still drop', () => {
+  // `allOf`, `anyOf`, `then`, `else`, `contains` and `propertyNames` all get
+  // weaker when a subschema does, so the guarantee holds under them.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    allOf: [{ pattern: '\\p{L}' }],
+    anyOf: [{ pattern: '\\p{N}' }],
+    contains: { pattern: '\\p{M}' },
+    propertyNames: { pattern: '\\p{P}' },
+    if: { type: 'string' },
+    then: { pattern: '\\p{S}' },
+    else: { pattern: '\\p{Z}' },
+  } }] });
+  const s = body.tools[0].input_schema;
+  for (const at of [s.allOf[0], s.anyOf[0], s.contains, s.propertyNames, s.then, s.else]) {
+    assert.equal(at.pattern, undefined);
+  }
+});
+
+test('a patternProperties entry sealed by unevaluatedProperties is refused', () => {
+  // `unevaluatedProperties: false` rejects what no keyword marked evaluated,
+  // and matching a `patternProperties` key is what marked those names. Delete
+  // the entry and they become unevaluated, so the schema narrows exactly as it
+  // does under a restrictive `additionalProperties` - and this one reaches
+  // down from an enclosing schema as well.
+  const sealed = { tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: false,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] };
+  assert.throws(() => portableSchemas(sealed), error => error instanceof UnsupportedRequest);
+
+  const enclosing = { tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: false,
+    allOf: [{ patternProperties: { '^\\p{L}+$': { type: 'string' } } }],
+  } }] };
+  assert.throws(() => portableSchemas(enclosing), error => error instanceof UnsupportedRequest);
+
+  // An open schema is untouched by the seal and is still widened.
+  const open = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    unevaluatedProperties: true,
+    patternProperties: { '^\\p{L}+$': { type: 'string' } },
+  } }] });
+  assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });

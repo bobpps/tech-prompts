@@ -301,6 +301,16 @@ function webSearchTools(body) {
 // and changes nothing the model is shown, and the tool still validates its own
 // arguments when the call arrives.
 //
+// That widening is what makes dropping safe, and it is a property of the
+// schema around the constraint rather than of the constraint. Under `not` the
+// polarity reverses - `{not: {pattern: ...}}` becomes `{not: {}}`, and the
+// empty schema accepts everything, so the negation rejects everything - while
+// `if` flips which branch applies and widening one `oneOf` branch can make two
+// match and fail the whole. Beneath any of those, dropping narrows, and the
+// request is refused with an explanation instead. The same is true of a
+// `patternProperties` entry under a restrictive `additionalProperties` or
+// `unevaluatedProperties`. So the guarantee is checked here, not assumed.
+//
 // The match is textual on purpose. A pattern that merely spells `\p` in an
 // escaped position loses a constraint it did not have to lose, which widens
 // what the request may carry and never rejects one; reading regex escape state
@@ -327,19 +337,28 @@ function webSearchTools(body) {
 // carry subschemas: such a list has to be complete to be safe, and `items`,
 // `contains`, `propertyNames`, `contentSchema` and the rest are only the ones
 // that exist today. Guessing wrong towards a schema costs a constraint the
-// provider would have enforced and never a request; guessing wrong the other
-// way leaves a pattern it refuses, and every turn in the session ends. Only
-// the second is worth avoiding, which is why the unknown case defaults to a
-// schema and the exceptions are named instead.
+// provider would have enforced and never a request - the widening check above
+// is what keeps that true - while guessing wrong the other way leaves a
+// pattern it refuses, and every turn in the session ends. Only the second is
+// worth avoiding, which is why the unknown case defaults to a schema and the
+// exceptions are named instead.
 const UNICODE_PROPERTY = /\\[pP]\{/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'example', 'examples'];
 const EXTENSION_KEY = /^x-/;
+const NON_MONOTONIC = ['not', 'if', 'oneOf'];
+
+// Absent or `true` leaves the object open; anything else can reject a name.
+function restrictive(value) {
+  return value !== undefined && value !== true;
+}
 const SCHEMA_MAPS = [
   'properties', 'patternProperties', '$defs', 'definitions', 'dependencies', 'dependentSchemas',
 ];
 
 function portableSchemas(body) {
-  for (const tool of (body && body.tools) || []) dropUnicodePatterns(tool.input_schema);
+  for (const tool of (body && body.tools) || []) {
+    dropUnicodePatterns(tool.input_schema, { widens: true, sealed: false });
+  }
   return body;
 }
 
@@ -356,15 +375,21 @@ function portableSchemas(body) {
 // change to what the tool accepts rather than to what the provider will
 // compile, so it is refused here with an explanation instead, the way a
 // web_search domain filter is.
-function dropUnicodeKeys(schema, map) {
+function dropUnicodeKeys(schema, map, context) {
   for (const key of Object.keys(map)) {
     if (!UNICODE_PROPERTY.test(key)) continue;
-    const additional = schema.additionalProperties;
-    if (additional !== undefined && additional !== true) {
+    if (!context.widens) {
+      throw new UnsupportedRequest(
+        'A tool schema names properties with ' + key + ' beneath not, if or oneOf, where Meta ' +
+        'cannot compile it and removing it would reject arguments the tool declares valid. ' +
+        'Remove the Unicode property escape from that tool schema, or turn the tool off.'
+      );
+    }
+    if (restrictive(schema.additionalProperties) || context.sealed) {
       throw new UnsupportedRequest(
         'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
-        'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
-        'property escape from that tool schema, or turn the tool off.'
+        'additionalProperties or unevaluatedProperties would reject the names that pattern ' +
+        'allows. Remove the Unicode property escape from that tool schema, or turn the tool off.'
       );
     }
     delete map[key];
@@ -373,24 +398,35 @@ function dropUnicodeKeys(schema, map) {
 
 // `node` is a subschema, or an array of them. Anything reached from here is
 // read as a schema unless one of the lists above says otherwise.
-function dropUnicodePatterns(node) {
+function dropUnicodePatterns(node, context) {
   if (Array.isArray(node)) {
-    for (const item of node) dropUnicodePatterns(item);
+    for (const item of node) dropUnicodePatterns(item, context);
     return;
   }
   if (!node || typeof node !== 'object') return;
+  // Read before the walk, so the seal holds whatever order the keys arrive in.
+  const sealed = context.sealed || restrictive(node.unevaluatedProperties);
+  const here = sealed === context.sealed ? context : { widens: context.widens, sealed };
   for (const [key, value] of Object.entries(node)) {
     if (key === 'pattern' && typeof value === 'string') {
-      if (UNICODE_PROPERTY.test(value)) delete node[key];
+      if (!UNICODE_PROPERTY.test(value)) continue;
+      if (!here.widens) {
+        throw new UnsupportedRequest(
+          'A tool schema constrains a value with ' + value + ' beneath not, if or oneOf, where ' +
+          'Meta cannot compile it and removing it would reject arguments the tool declares ' +
+          'valid. Remove the Unicode property escape from that tool schema, or turn the tool off.'
+        );
+      }
+      delete node[key];
     } else if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) {
       continue;
     } else if (SCHEMA_MAPS.includes(key)) {
       if (value && typeof value === 'object') {
-        if (key === 'patternProperties') dropUnicodeKeys(node, value);
-        for (const sub of Object.values(value)) dropUnicodePatterns(sub);
+        if (key === 'patternProperties') dropUnicodeKeys(node, value, here);
+        for (const sub of Object.values(value)) dropUnicodePatterns(sub, here);
       }
     } else {
-      dropUnicodePatterns(value);
+      dropUnicodePatterns(value, NON_MONOTONIC.includes(key) ? { widens: false, sealed: here.sealed } : here);
     }
   }
 }
