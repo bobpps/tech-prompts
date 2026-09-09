@@ -228,9 +228,12 @@ fence indented under three spaces, which CommonMark lets close a block just as o
 does. That is the failure that once truncated the installed README to a third of its length, and it
 can no longer be written by hand.
 
-Sources are LF only. `build.cjs` refuses one carrying a carriage return and `check.cjs` refuses a
-prompt that carries one, because a CR copied into the POSIX shim would leave `#!/usr/bin/env bash`
-followed by a carriage return, which is not a shebang.
+Sources are LF only and must end with a newline. `build.cjs` refuses one carrying a carriage return
+and `check.cjs` refuses a prompt that carries one, because a CR copied into the POSIX shim would
+leave `#!/usr/bin/env bash` followed by a carriage return, which is not a shebang. A missing final
+newline is refused for a quieter reason: the block would carry one anyway, so the installed file
+would end up a byte longer than the source it came from, and the copy-over recipe above would stop
+being true.
 
 `sources/` mirrors the installed tree minus the leading dots, so every file sits where its
 installed twin does. The launcher, the adapter, their two suites and the installed README are the
