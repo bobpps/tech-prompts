@@ -560,6 +560,30 @@ test('a tool argument named like a schema keyword is still a schema', () => {
   assert.equal(schema.enum[0].pattern, '\\p{N}');
 });
 
+test('an unknown keyword is read as a schema; a named annotation is not', () => {
+  // A keyword this walker has never heard of is walked as a schema. Guessing
+  // wrong that way drops a constraint the provider was going to enforce and
+  // widens what the request may carry; guessing wrong the other way leaves a
+  // pattern the provider refuses, which ends every turn in the session. Only
+  // the second is worth avoiding, so the unknown case is not left to a list of
+  // schema-bearing keywords that would have to be complete to be safe.
+  const body = portableSchemas({ tools: [{ name: 'X', input_schema: {
+    type: 'object',
+    // Values, by name and by the `x-` extension space. Left alone.
+    example: { pattern: '\\p{L}+' },
+    'x-vendor': { metadata: { pattern: '\\p{N}+' } },
+    properties: {
+      // `contentSchema` really is a subschema keyword, and this walker does
+      // not list it. The catch-all is what keeps that from mattering.
+      doc: { type: 'string', contentSchema: { type: 'string', pattern: '\\p{M}' } },
+    },
+  } }] });
+  const schema = body.tools[0].input_schema;
+  assert.equal(schema.example.pattern, '\\p{L}+');
+  assert.equal(schema['x-vendor'].metadata.pattern, '\\p{N}+');
+  assert.equal(schema.properties.doc.contentSchema.pattern, undefined);
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });

@@ -306,9 +306,10 @@ function webSearchTools(body) {
 // what the request may carry and never rejects one; reading regex escape state
 // to avoid that would be more machinery than the failure is worth.
 //
-// Which key means what depends on where it sits. `const`, `default`, `enum`
-// and `examples` hold arbitrary JSON rather than subschemas, so a member named
-// `pattern` inside one of them is a value the tool receives and is left alone.
+// Which key means what depends on where it sits. `const`, `default`, `enum`,
+// `example` and `examples` hold arbitrary JSON rather than subschemas, so a
+// member named `pattern` inside one of them is a value the tool receives and
+// is left alone, as is anything under the conventional `x-` extension space.
 // But `properties` and `$defs` map a name the tool chose to a subschema, and
 // those names are not keywords: an argument called `default` is a schema and
 // has to be descended into, or its pattern survives and produces the very 400
@@ -320,8 +321,19 @@ function webSearchTools(body) {
 // `dependencies` is in it for its draft-07 subschema form, and its other form,
 // a list of required property names, is walked harmlessly. `dependentRequired`
 // is absent because it only ever holds those lists.
+//
+// A keyword in neither list is walked as a schema. JSON Schema lets a tool add
+// keywords of its own, so this cannot be decided from a list of the ones that
+// carry subschemas: such a list has to be complete to be safe, and `items`,
+// `contains`, `propertyNames`, `contentSchema` and the rest are only the ones
+// that exist today. Guessing wrong towards a schema costs a constraint the
+// provider would have enforced and never a request; guessing wrong the other
+// way leaves a pattern it refuses, and every turn in the session ends. Only
+// the second is worth avoiding, which is why the unknown case defaults to a
+// schema and the exceptions are named instead.
 const UNICODE_PROPERTY = /\\[pP]\{/;
-const SCHEMA_VALUES = ['const', 'default', 'enum', 'examples'];
+const SCHEMA_VALUES = ['const', 'default', 'enum', 'example', 'examples'];
+const EXTENSION_KEY = /^x-/;
 const SCHEMA_MAPS = [
   'properties', 'patternProperties', '$defs', 'definitions', 'dependencies', 'dependentSchemas',
 ];
@@ -342,7 +354,7 @@ function dropUnicodePatterns(node) {
   for (const [key, value] of Object.entries(node)) {
     if (key === 'pattern' && typeof value === 'string') {
       if (UNICODE_PROPERTY.test(value)) delete node[key];
-    } else if (SCHEMA_VALUES.includes(key)) {
+    } else if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) {
       continue;
     } else if (SCHEMA_MAPS.includes(key)) {
       if (value && typeof value === 'object') for (const sub of Object.values(value)) dropUnicodePatterns(sub);
