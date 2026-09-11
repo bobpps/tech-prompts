@@ -284,8 +284,3 @@ somebody actually edited. It also refuses a fenced block that ends early because
 fence of its own — the failure that once truncated the installed README to a third of its length.
 No API key, no network, about two seconds. It verifies mechanism only; the prose still needs a
 reader.
-
-## Source
-
-Generated from the "Claude Muse Installer" artifact (`muse-spark-1.3-contributor` revision):
-<https://claude.ai/code/artifact/d1d01559-657c-450b-af63-494d3e81a561> (private).
