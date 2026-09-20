@@ -49,18 +49,26 @@ Page fetching happens inside Meta's own search tool. The separate
 
 ## Regex patterns in tool schemas
 
-Meta compiles every JSON Schema `pattern` a tool declares with a strict
-ECMA-262 validator, and refuses the whole request when one of them does not
-parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
-constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
-property escapes, and in the CLI they sit in a regex literal carrying the `u`
-flag that gives them a meaning. A `pattern` is a bare string and carries no
-flags, so what arrives upstream is a regex the provider cannot compile.
+Meta compiles every JSON Schema `pattern` a tool declares, and refuses the whole
+request when one of them does not parse there. Claude Code ships patterns that
+do not. In the CLI they are regex literals, where the flags and the JavaScript
+grammar around them give them a meaning; a `pattern` is a bare string, and it
+arrives at a different engine with neither. The shapes measured to fail are a
+Unicode property escape — `\p{Cc}` and friends — and a backslash-digit escape
+inside a character class, such as the `^[^\0]*$` the Artifact tool puts on its
+file-path argument, which Node and Python both compile.
+
+Which shapes those are does not hold still. Meta has changed regex engines under
+this adapter: `\p{Cc}`, which it refused when this was written, it now accepts.
+That is why the adapter matches a class of expression rather than the one regex
+that produced a report, and why it removes the constraint instead of rewriting
+it into something today's engine takes — a rewrite has to be right about the
+engine, while a removal only has to be wrong in the direction that widens.
 
 One bad schema among the whole set is enough to end every turn, so the symptom
 is that nothing works at all rather than that one tool is broken. The adapter
-removes any `pattern` containing `\p{` or `\P{` from `tools[].input_schema`,
-and leaves every other pattern in place. Only the constraint goes: `pattern`
+removes any `pattern` containing `\p{`, `\P{`, or a backslash followed by a
+digit from `tools[].input_schema`, and leaves every other pattern in place. Only the constraint goes: `pattern`
 tells the provider what to reject, not the model what to send, so the tool
 description the model reads is unchanged and the tool still validates its own
 arguments when the call arrives.

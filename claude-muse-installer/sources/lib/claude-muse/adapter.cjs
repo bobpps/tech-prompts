@@ -279,21 +279,29 @@ function webSearchTools(body) {
   return body;
 }
 
-// Meta compiles every JSON Schema `pattern` a tool declares with a strict
-// ECMA-262 validator, and refuses the whole request when one of them does not
-// parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
-// constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
-// property escapes, and in the CLI they sit in a regex literal carrying the
-// `u` flag that gives them a meaning. A `pattern` is a bare string and carries
-// no flags, so what arrives upstream is a regex the provider cannot compile.
+// Meta compiles every JSON Schema `pattern` a tool declares, and refuses the
+// whole request when one of them does not parse there. Claude Code ships
+// patterns that do not. In the CLI they are regex literals, where the flags and
+// the JavaScript grammar around them give them a meaning; a `pattern` is a bare
+// string, and it arrives at a different engine with neither. `UNPORTABLE` holds
+// the expressions measured to be refused - a Unicode property escape, and a
+// backslash-digit escape such as the `[^\0]` the Artifact tool puts on its
+// file-path argument, which Node and Python both compile and Meta does not.
+//
+// Which expressions those are does not hold still: the provider has changed
+// engines under this transform, and an expression it refused when this was
+// written it now accepts. That is the argument for removing the constraint
+// rather than rewriting it into something today's engine takes - a rewrite has
+// to be right about the engine, while a removal only has to be wrong in the
+// direction that widens.
 //
 // One bad schema among the whole set kills every call in the session, so the
 // visible symptom is that the model is unavailable rather than that one tool is
 // broken. The schema is also behind a server-side feature gate, which is why
 // the same CLI build fails on one machine and works on another, and why the
-// set of schemas sent can change without an update. Matching the class - a
-// Unicode property escape anywhere in a pattern - rather than this one regex
-// is what keeps the next gated schema from reopening this.
+// set of schemas sent can change without an update. Matching a class of
+// expression anywhere in a pattern, rather than the one regex that produced
+// the report, is what keeps the next gated schema from reopening this.
 //
 // Only the constraint is removed, never the property it constrained. `pattern`
 // tells the provider what to reject; it is not part of what the model reads to
@@ -355,7 +363,7 @@ function webSearchTools(body) {
 // pattern it refuses, and every turn in the session ends. Only the second is
 // worth avoiding, which is why the unknown case defaults to a schema and the
 // exceptions are named instead.
-const UNICODE_PROPERTY = /\\[pP]\{/;
+const UNPORTABLE = /\\[pP]\{|\\\d/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'example', 'examples'];
 const EXTENSION_KEY = /^x-/;
 const ENTANGLED_ALWAYS = ['not', 'if', 'oneOf', 'maxContains'];
@@ -371,7 +379,7 @@ const SCHEMA_MAPS = [
 
 function portableSchemas(body) {
   for (const tool of (body && body.tools) || []) {
-    const found = unicodeRegex(tool.input_schema);
+    const found = unportableRegex(tool.input_schema);
     if (!found) continue;
     const entangled = entangling(tool.input_schema);
     if (entangled) {
@@ -379,10 +387,10 @@ function portableSchemas(body) {
         'A tool schema uses ' + found + ', which Meta cannot compile, in a schema that also ' +
         'uses ' + entangled + '. Removing the expression widens an ordinary schema, but next ' +
         'to that keyword it can narrow one instead and reject arguments the tool declares ' +
-        'valid. Remove the Unicode property escape from that tool schema, or turn the tool off.'
+        'valid. Remove that expression from the tool schema, or turn the tool off.'
       );
     }
-    dropUnicodePatterns(tool.input_schema);
+    dropUnportablePatterns(tool.input_schema);
   }
   return body;
 }
@@ -422,12 +430,12 @@ function eachSchema(node, visit) {
 // and the provider compiles it the same way, so a schema can be refused for a
 // key alone. Only this map is keyed by a regex; `properties`, `$defs` and the
 // rest are keyed by names.
-function unicodeRegex(schema) {
+function unportableRegex(schema) {
   return eachSchema(schema, node => {
-    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) return node.pattern;
+    if (typeof node.pattern === 'string' && UNPORTABLE.test(node.pattern)) return node.pattern;
     const map = node.patternProperties;
     if (!map || typeof map !== 'object') return null;
-    return Object.keys(map).find(key => UNICODE_PROPERTY.test(key)) || null;
+    return Object.keys(map).find(key => UNPORTABLE.test(key)) || null;
   });
 }
 
@@ -446,18 +454,18 @@ function entangling(schema) {
 // `patternProperties` entry: dropping it leaves the names it matched
 // unconstrained and still accepted, unless a sibling `additionalProperties`
 // would now reject them, because matching the key is what exempted them.
-function dropUnicodePatterns(schema) {
+function dropUnportablePatterns(schema) {
   eachSchema(schema, node => {
-    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) delete node.pattern;
+    if (typeof node.pattern === 'string' && UNPORTABLE.test(node.pattern)) delete node.pattern;
     const map = node.patternProperties;
     if (!map || typeof map !== 'object') return null;
     for (const key of Object.keys(map)) {
-      if (!UNICODE_PROPERTY.test(key)) continue;
+      if (!UNPORTABLE.test(key)) continue;
       if (restrictive(node.additionalProperties)) {
         throw new UnsupportedRequest(
           'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
-          'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
-          'property escape from that tool schema, or turn the tool off.'
+          'additionalProperties would reject the names that pattern allows. Remove that ' +
+          'expression from the tool schema, or turn the tool off.'
         );
       }
       delete map[key];

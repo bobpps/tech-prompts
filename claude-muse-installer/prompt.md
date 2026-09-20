@@ -1079,21 +1079,29 @@ function webSearchTools(body) {
   return body;
 }
 
-// Meta compiles every JSON Schema `pattern` a tool declares with a strict
-// ECMA-262 validator, and refuses the whole request when one of them does not
-// parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
-// constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
-// property escapes, and in the CLI they sit in a regex literal carrying the
-// `u` flag that gives them a meaning. A `pattern` is a bare string and carries
-// no flags, so what arrives upstream is a regex the provider cannot compile.
+// Meta compiles every JSON Schema `pattern` a tool declares, and refuses the
+// whole request when one of them does not parse there. Claude Code ships
+// patterns that do not. In the CLI they are regex literals, where the flags and
+// the JavaScript grammar around them give them a meaning; a `pattern` is a bare
+// string, and it arrives at a different engine with neither. `UNPORTABLE` holds
+// the expressions measured to be refused - a Unicode property escape, and a
+// backslash-digit escape such as the `[^\0]` the Artifact tool puts on its
+// file-path argument, which Node and Python both compile and Meta does not.
+//
+// Which expressions those are does not hold still: the provider has changed
+// engines under this transform, and an expression it refused when this was
+// written it now accepts. That is the argument for removing the constraint
+// rather than rewriting it into something today's engine takes - a rewrite has
+// to be right about the engine, while a removal only has to be wrong in the
+// direction that widens.
 //
 // One bad schema among the whole set kills every call in the session, so the
 // visible symptom is that the model is unavailable rather than that one tool is
 // broken. The schema is also behind a server-side feature gate, which is why
 // the same CLI build fails on one machine and works on another, and why the
-// set of schemas sent can change without an update. Matching the class - a
-// Unicode property escape anywhere in a pattern - rather than this one regex
-// is what keeps the next gated schema from reopening this.
+// set of schemas sent can change without an update. Matching a class of
+// expression anywhere in a pattern, rather than the one regex that produced
+// the report, is what keeps the next gated schema from reopening this.
 //
 // Only the constraint is removed, never the property it constrained. `pattern`
 // tells the provider what to reject; it is not part of what the model reads to
@@ -1155,7 +1163,7 @@ function webSearchTools(body) {
 // pattern it refuses, and every turn in the session ends. Only the second is
 // worth avoiding, which is why the unknown case defaults to a schema and the
 // exceptions are named instead.
-const UNICODE_PROPERTY = /\\[pP]\{/;
+const UNPORTABLE = /\\[pP]\{|\\\d/;
 const SCHEMA_VALUES = ['const', 'default', 'enum', 'example', 'examples'];
 const EXTENSION_KEY = /^x-/;
 const ENTANGLED_ALWAYS = ['not', 'if', 'oneOf', 'maxContains'];
@@ -1171,7 +1179,7 @@ const SCHEMA_MAPS = [
 
 function portableSchemas(body) {
   for (const tool of (body && body.tools) || []) {
-    const found = unicodeRegex(tool.input_schema);
+    const found = unportableRegex(tool.input_schema);
     if (!found) continue;
     const entangled = entangling(tool.input_schema);
     if (entangled) {
@@ -1179,10 +1187,10 @@ function portableSchemas(body) {
         'A tool schema uses ' + found + ', which Meta cannot compile, in a schema that also ' +
         'uses ' + entangled + '. Removing the expression widens an ordinary schema, but next ' +
         'to that keyword it can narrow one instead and reject arguments the tool declares ' +
-        'valid. Remove the Unicode property escape from that tool schema, or turn the tool off.'
+        'valid. Remove that expression from the tool schema, or turn the tool off.'
       );
     }
-    dropUnicodePatterns(tool.input_schema);
+    dropUnportablePatterns(tool.input_schema);
   }
   return body;
 }
@@ -1222,12 +1230,12 @@ function eachSchema(node, visit) {
 // and the provider compiles it the same way, so a schema can be refused for a
 // key alone. Only this map is keyed by a regex; `properties`, `$defs` and the
 // rest are keyed by names.
-function unicodeRegex(schema) {
+function unportableRegex(schema) {
   return eachSchema(schema, node => {
-    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) return node.pattern;
+    if (typeof node.pattern === 'string' && UNPORTABLE.test(node.pattern)) return node.pattern;
     const map = node.patternProperties;
     if (!map || typeof map !== 'object') return null;
-    return Object.keys(map).find(key => UNICODE_PROPERTY.test(key)) || null;
+    return Object.keys(map).find(key => UNPORTABLE.test(key)) || null;
   });
 }
 
@@ -1246,18 +1254,18 @@ function entangling(schema) {
 // `patternProperties` entry: dropping it leaves the names it matched
 // unconstrained and still accepted, unless a sibling `additionalProperties`
 // would now reject them, because matching the key is what exempted them.
-function dropUnicodePatterns(schema) {
+function dropUnportablePatterns(schema) {
   eachSchema(schema, node => {
-    if (typeof node.pattern === 'string' && UNICODE_PROPERTY.test(node.pattern)) delete node.pattern;
+    if (typeof node.pattern === 'string' && UNPORTABLE.test(node.pattern)) delete node.pattern;
     const map = node.patternProperties;
     if (!map || typeof map !== 'object') return null;
     for (const key of Object.keys(map)) {
-      if (!UNICODE_PROPERTY.test(key)) continue;
+      if (!UNPORTABLE.test(key)) continue;
       if (restrictive(node.additionalProperties)) {
         throw new UnsupportedRequest(
           'A tool schema names properties with ' + key + ', which Meta cannot compile, and its ' +
-          'additionalProperties would reject the names that pattern allows. Remove the Unicode ' +
-          'property escape from that tool schema, or turn the tool off.'
+          'additionalProperties would reject the names that pattern allows. Remove that ' +
+          'expression from the tool schema, or turn the tool off.'
         );
       }
       delete map[key];
@@ -2368,6 +2376,35 @@ test('a Unicode-property pattern is dropped from a tool schema, and nothing else
   assert.equal(body.messages[0].content[0].input.pattern, '\\p{L}');
 });
 
+test('an escape the provider refuses inside a character class is dropped too', () => {
+  // What Claude Code puts on Artifact's `file_paths` items, taken off the wire:
+  // in the CLI it is `.regex(/^[^\0]*$/)`, and it reaches the provider as a bare
+  // string. Node and Python both compile it; the provider's validator refuses a
+  // backslash-digit escape inside a character class, and one refused pattern
+  // fails the whole request rather than the one tool. `\d` and `\s` are escapes
+  // it does compile, so carrying a backslash is not what makes a pattern
+  // suspect - these stay, and the request keeps the constraints it can enforce.
+  const nul = '^[^\\0]*$';
+  const semver = '^(0|[1-9]\\d{0,3})\\.(0|[1-9]\\d{0,4})$';
+  const anyChar = '^[\\s\\S]{0,300}$';
+  const body = portableSchemas({ tools: [{ name: 'Artifact', input_schema: {
+    type: 'object',
+    properties: {
+      file_paths: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 1024, pattern: nul } },
+      contract: { type: 'string', pattern: semver },
+      label: { type: 'string', pattern: anyChar },
+    },
+  } }] });
+  const props = body.tools[0].input_schema.properties;
+  assert.equal(props.file_paths.items.pattern, undefined);
+  // Only the expression the provider cannot compile goes. The bounds beside it
+  // are constraints it compiles nothing for, and the model reads them.
+  assert.equal(props.file_paths.items.minLength, 1);
+  assert.equal(props.file_paths.items.maxLength, 1024);
+  assert.equal(props.contract.pattern, semver);
+  assert.equal(props.label.pattern, anyChar);
+});
+
 test('a pattern that is a value rather than a constraint is left alone', () => {
   // `const`, `default`, `enum` and `examples` hold arbitrary JSON, not
   // subschemas. An object inside one of them may have a member named `pattern`,
@@ -2745,18 +2782,26 @@ Page fetching happens inside Meta's own search tool. The separate
 
 ## Regex patterns in tool schemas
 
-Meta compiles every JSON Schema `pattern` a tool declares with a strict
-ECMA-262 validator, and refuses the whole request when one of them does not
-parse. Claude Code 2.1.266 ships one that does not: the Artifact tool
-constrains its `field` argument with `\p{Cc}` and friends. Those are Unicode
-property escapes, and in the CLI they sit in a regex literal carrying the `u`
-flag that gives them a meaning. A `pattern` is a bare string and carries no
-flags, so what arrives upstream is a regex the provider cannot compile.
+Meta compiles every JSON Schema `pattern` a tool declares, and refuses the whole
+request when one of them does not parse there. Claude Code ships patterns that
+do not. In the CLI they are regex literals, where the flags and the JavaScript
+grammar around them give them a meaning; a `pattern` is a bare string, and it
+arrives at a different engine with neither. The shapes measured to fail are a
+Unicode property escape — `\p{Cc}` and friends — and a backslash-digit escape
+inside a character class, such as the `^[^\0]*$` the Artifact tool puts on its
+file-path argument, which Node and Python both compile.
+
+Which shapes those are does not hold still. Meta has changed regex engines under
+this adapter: `\p{Cc}`, which it refused when this was written, it now accepts.
+That is why the adapter matches a class of expression rather than the one regex
+that produced a report, and why it removes the constraint instead of rewriting
+it into something today's engine takes — a rewrite has to be right about the
+engine, while a removal only has to be wrong in the direction that widens.
 
 One bad schema among the whole set is enough to end every turn, so the symptom
 is that nothing works at all rather than that one tool is broken. The adapter
-removes any `pattern` containing `\p{` or `\P{` from `tools[].input_schema`,
-and leaves every other pattern in place. Only the constraint goes: `pattern`
+removes any `pattern` containing `\p{`, `\P{`, or a backslash followed by a
+digit from `tools[].input_schema`, and leaves every other pattern in place. Only the constraint goes: `pattern`
 tells the provider what to reject, not the model what to send, so the tool
 description the model reads is unchanged and the tool still validates its own
 arguments when the call arrives.
@@ -3135,8 +3180,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are forty-eight offline tests in total: thirty-one in
-`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-eight must
+There are forty-nine offline tests in total: thirty-two in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-nine must
 pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.

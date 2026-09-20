@@ -507,6 +507,35 @@ test('a Unicode-property pattern is dropped from a tool schema, and nothing else
   assert.equal(body.messages[0].content[0].input.pattern, '\\p{L}');
 });
 
+test('an escape the provider refuses inside a character class is dropped too', () => {
+  // What Claude Code puts on Artifact's `file_paths` items, taken off the wire:
+  // in the CLI it is `.regex(/^[^\0]*$/)`, and it reaches the provider as a bare
+  // string. Node and Python both compile it; the provider's validator refuses a
+  // backslash-digit escape inside a character class, and one refused pattern
+  // fails the whole request rather than the one tool. `\d` and `\s` are escapes
+  // it does compile, so carrying a backslash is not what makes a pattern
+  // suspect - these stay, and the request keeps the constraints it can enforce.
+  const nul = '^[^\\0]*$';
+  const semver = '^(0|[1-9]\\d{0,3})\\.(0|[1-9]\\d{0,4})$';
+  const anyChar = '^[\\s\\S]{0,300}$';
+  const body = portableSchemas({ tools: [{ name: 'Artifact', input_schema: {
+    type: 'object',
+    properties: {
+      file_paths: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 1024, pattern: nul } },
+      contract: { type: 'string', pattern: semver },
+      label: { type: 'string', pattern: anyChar },
+    },
+  } }] });
+  const props = body.tools[0].input_schema.properties;
+  assert.equal(props.file_paths.items.pattern, undefined);
+  // Only the expression the provider cannot compile goes. The bounds beside it
+  // are constraints it compiles nothing for, and the model reads them.
+  assert.equal(props.file_paths.items.minLength, 1);
+  assert.equal(props.file_paths.items.maxLength, 1024);
+  assert.equal(props.contract.pattern, semver);
+  assert.equal(props.label.pattern, anyChar);
+});
+
 test('a pattern that is a value rather than a constraint is left alone', () => {
   // `const`, `default`, `enum` and `examples` hold arbitrary JSON, not
   // subschemas. An object inside one of them may have a member named `pattern`,
