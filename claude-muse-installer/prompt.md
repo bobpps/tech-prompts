@@ -1292,6 +1292,64 @@ function stopSequences(body) {
   return body;
 }
 
+// Meta requires `required` on a structured-output schema to name every key in
+// `properties`, and refuses the request when one is missing. Claude Code's own
+// hook evaluator declares `impossible` as an optional third property beside a
+// `required` of two, so every evaluation of a prompt Stop hook fails - not the
+// turn, which carries no output schema, but the call that judges whether the
+// session may end, which is why the symptom is a hook error rather than a dead
+// model.
+//
+// The repair runs the other way from the one for `pattern`: a constraint that
+// cannot be compiled is removed, but a property that is merely optional cannot
+// be, because dropping `impossible` would take the `impossible: true` verdict
+// with it - the one outcome that lets the session stop. Adding the key to
+// `required` instead narrows what the model may omit, and that narrowing costs
+// nothing at the callers that set this field: they are the CLI's own
+// evaluators, whose parsers read an explicit false exactly as they read an
+// absent field, so forcing the key present changes what is written and never
+// what is decided. Refusing the request instead, the way an un-widenable
+// `pattern` is refused, would only move the current symptom - a hook that
+// never judges - from the provider to this file.
+//
+// Nested objects are completed too. The provider judges the whole schema, not
+// just its top level, and a nested `properties` with its own short `required`
+// would fail the same way one turn later if only the top level were fixed.
+// Members that hold values rather than schemas - `const`, `default`, `enum`
+// and the rest - are not descended into, for the same reason `portableSchemas`
+// leaves them alone: a member named `properties` inside one of them is data
+// the model receives, not a schema the provider compiles.
+//
+// Completions are counted into the debug log, so a future caller whose parser
+// does distinguish an absent field from an explicit one shows up as a log line
+// rather than only as a hook that stopped judging.
+function completeRequired(body) {
+  const format = body && typeof body === 'object' && body.output_config && body.output_config.format;
+  if (!format || typeof format !== 'object' || format.type !== 'json_schema') return body;
+  let completed = 0;
+  const cover = node => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) cover(item);
+      return;
+    }
+    const props = node.properties;
+    if (props && typeof props === 'object' && !Array.isArray(props)) {
+      if (!Array.isArray(node.required)) node.required = [];
+      for (const key of Object.keys(props)) {
+        if (!node.required.includes(key)) { node.required.push(key); completed++; }
+      }
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) continue;
+      cover(value);
+    }
+  };
+  cover(format.schema);
+  if (completed) debugLog({ event: 'required_completed', fields: completed });
+  return body;
+}
+
 // Buffers a non-streaming body chunk by chunk rather than through `.json()` or
 // `.arrayBuffer()`, so the idle timer sees the transfer and a slow but healthy
 // download is not mistaken for a dead connection.
@@ -1424,7 +1482,7 @@ async function startProxy(upstream, token, idleSeconds) {
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
         });
-        payload = JSON.stringify(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed))))));
+        payload = JSON.stringify(completeRequired(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed)))))));
       }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
@@ -1503,7 +1561,7 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, completeRequired, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
 ```
 
 Create `~/.local/lib/claude-muse/launcher.test.cjs` with this exact content:
@@ -1875,7 +1933,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, completeRequired, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -2616,6 +2674,57 @@ test('a patternProperties entry sealed by unevaluatedProperties is refused', () 
   assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
 });
 
+test('an output schema names every property it declares in required', () => {
+  // What the Stop-hook evaluator sends, taken off the wire: a structured-output
+  // schema with three properties and a `required` of two. The provider refuses
+  // the whole request for the missing third key, so the hook never judges and
+  // every stop ends in a hook error instead of a verdict.
+  const evaluator = () => ({ output_config: { effort: 'high', format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: { ok: { type: 'boolean' }, reason: { type: 'string' }, impossible: { type: 'boolean' } },
+    required: ['ok', 'reason'],
+    additionalProperties: false,
+  } } } });
+  const body = completeRequired({ tools: [], ...evaluator() });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.required, ['ok', 'reason', 'impossible']);
+  // The completion changes what the model must write, never what the caller
+  // decides: the evaluator treats an explicit false exactly as an absent field.
+  // Everything else on the request - the effort the provider does accept, the
+  // property types, the closed shape - leaves exactly as it arrived.
+  assert.equal(body.output_config.effort, 'high');
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.properties.impossible, { type: 'boolean' });
+});
+
+test('a missing or short required is completed at every level, and nothing else is', () => {
+  // A schema with no `required` at all is refused the same way as one that is
+  // short, and the provider judges the whole schema, so a nested object with
+  // its own short `required` would fail one turn later if only the top level
+  // were fixed.
+  const body = completeRequired({ output_config: { format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      nested: { type: 'object', properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a'] },
+    },
+  } } } });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.required, ['title', 'nested']);
+  assert.deepEqual(schema.properties.nested.required, ['a', 'b']);
+  // A schema that already names everything, a format that is not a JSON schema,
+  // and a request with no output schema at all pass through untouched.
+  const covered = { output_config: { format: { type: 'json_schema', schema: {
+    type: 'object', properties: { a: { type: 'string' } }, required: ['a'],
+  } } } };
+  assert.deepEqual(completeRequired(covered), covered);
+  const other = { output_config: { format: { type: 'text' } } };
+  assert.deepEqual(completeRequired(other), other);
+  assert.deepEqual(completeRequired({ tools: [] }), { tools: [] });
+  assert.deepEqual(completeRequired({}), {});
+  assert.deepEqual(completeRequired(null), null);
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
@@ -2846,6 +2955,31 @@ is set to, including `true`, because the CLI compares the variable against the
 boolean `true` and an environment variable is always a string. This is a
 stopgap: it gives up a working feature to route around one bad pattern, and the
 transform above is what closes the class.
+
+## Structured-output schemas must name every property in `required`
+
+Claude Code's own evaluators answer in JSON: the Stop-hook evaluator, the
+session-title generator, the branch-name proposer. Those calls carry
+`output_config.format`, a JSON schema for the reply, and Meta requires its
+`required` to name every key in `properties`. The evaluator declares
+`impossible` as an optional third property beside a `required` of two, so
+every evaluation of a prompt Stop hook fails - not the turn, which carries no
+output schema, but the call that judges whether the session may end. The
+symptom is a hook error at every stop, never a dead model, and the hook never
+judges: the session either runs on unconditionally or loops on a condition
+that was actually met.
+
+The repair runs the other way from the one for `pattern`. A constraint that
+cannot be compiled is removed, but an optional property cannot be dropped,
+because dropping `impossible` would take the `impossible: true` verdict with
+it - the one outcome that lets the session stop. The adapter adds the missing
+keys to `required` instead, at every level of the schema. That narrowing costs
+nothing at the callers that set this field: they are the CLI's own evaluators,
+whose parsers read an explicit false exactly as they read an absent field, so
+forcing the key present changes what is written and never what is decided.
+Completions are counted into the request log, so a future caller whose parser
+does distinguish the two shows up as a log line rather than only as a hook
+that stopped judging.
 
 ## Auto mode
 
@@ -3180,8 +3314,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are forty-nine offline tests in total: thirty-two in
-`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All forty-nine must
+There are fifty-one offline tests in total: thirty-four in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All fifty-one must
 pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.

@@ -492,6 +492,64 @@ function stopSequences(body) {
   return body;
 }
 
+// Meta requires `required` on a structured-output schema to name every key in
+// `properties`, and refuses the request when one is missing. Claude Code's own
+// hook evaluator declares `impossible` as an optional third property beside a
+// `required` of two, so every evaluation of a prompt Stop hook fails - not the
+// turn, which carries no output schema, but the call that judges whether the
+// session may end, which is why the symptom is a hook error rather than a dead
+// model.
+//
+// The repair runs the other way from the one for `pattern`: a constraint that
+// cannot be compiled is removed, but a property that is merely optional cannot
+// be, because dropping `impossible` would take the `impossible: true` verdict
+// with it - the one outcome that lets the session stop. Adding the key to
+// `required` instead narrows what the model may omit, and that narrowing costs
+// nothing at the callers that set this field: they are the CLI's own
+// evaluators, whose parsers read an explicit false exactly as they read an
+// absent field, so forcing the key present changes what is written and never
+// what is decided. Refusing the request instead, the way an un-widenable
+// `pattern` is refused, would only move the current symptom - a hook that
+// never judges - from the provider to this file.
+//
+// Nested objects are completed too. The provider judges the whole schema, not
+// just its top level, and a nested `properties` with its own short `required`
+// would fail the same way one turn later if only the top level were fixed.
+// Members that hold values rather than schemas - `const`, `default`, `enum`
+// and the rest - are not descended into, for the same reason `portableSchemas`
+// leaves them alone: a member named `properties` inside one of them is data
+// the model receives, not a schema the provider compiles.
+//
+// Completions are counted into the debug log, so a future caller whose parser
+// does distinguish an absent field from an explicit one shows up as a log line
+// rather than only as a hook that stopped judging.
+function completeRequired(body) {
+  const format = body && typeof body === 'object' && body.output_config && body.output_config.format;
+  if (!format || typeof format !== 'object' || format.type !== 'json_schema') return body;
+  let completed = 0;
+  const cover = node => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) cover(item);
+      return;
+    }
+    const props = node.properties;
+    if (props && typeof props === 'object' && !Array.isArray(props)) {
+      if (!Array.isArray(node.required)) node.required = [];
+      for (const key of Object.keys(props)) {
+        if (!node.required.includes(key)) { node.required.push(key); completed++; }
+      }
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) continue;
+      cover(value);
+    }
+  };
+  cover(format.schema);
+  if (completed) debugLog({ event: 'required_completed', fields: completed });
+  return body;
+}
+
 // Buffers a non-streaming body chunk by chunk rather than through `.json()` or
 // `.arrayBuffer()`, so the idle timer sees the transfer and a slow but healthy
 // download is not mistaken for a dead connection.
@@ -624,7 +682,7 @@ async function startProxy(upstream, token, idleSeconds) {
           messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           longest_tool: Math.max(0, ...(parsed.tools || []).map(t => (t && typeof t.name === 'string' ? t.name.length : 0))),
         });
-        payload = JSON.stringify(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed))))));
+        payload = JSON.stringify(completeRequired(stopSequences(plainCacheControl(portableSchemas(webSearchTools(names.request(parsed)))))));
       }
       const response = await fetch(target, {
         method: req.method, headers, redirect: 'error', signal: abort.signal,
@@ -703,4 +761,4 @@ async function startProxy(upstream, token, idleSeconds) {
   return { server, url: 'http://127.0.0.1:' + server.address().port, token: localToken };
 }
 
-module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
+module.exports = { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, completeRequired, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType };
