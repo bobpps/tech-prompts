@@ -514,10 +514,13 @@ function stopSequences(body) {
 //
 // Nested objects are completed too. The provider judges the whole schema, not
 // just its top level, and a nested `properties` with its own short `required`
-// would fail the same way one turn later if only the top level were fixed.
-// Members that hold values rather than schemas - `const`, `default`, `enum`
-// and the rest - are not descended into, for the same reason `portableSchemas`
-// leaves them alone: a member named `properties` inside one of them is data
+// would fail the same way one turn later if only the top level were fixed. The
+// walk reuses the same map-aware traversal as `portableSchemas`: a subschema
+// under a property literally called `default` is visited through the map, and
+// a map itself is never mistaken for a schema, so a property literally called
+// `properties` does not gain a `required` array of its own. Members that hold
+// values rather than schemas - `const`, `default`, `enum` and the rest - are
+// not descended into: a member named `properties` inside one of them is data
 // the model receives, not a schema the provider compiles.
 //
 // Completions are counted into the debug log, so a future caller whose parser
@@ -527,25 +530,15 @@ function completeRequired(body) {
   const format = body && typeof body === 'object' && body.output_config && body.output_config.format;
   if (!format || typeof format !== 'object' || format.type !== 'json_schema') return body;
   let completed = 0;
-  const cover = node => {
-    if (!node || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      for (const item of node) cover(item);
-      return;
-    }
+  eachSchema(format.schema, node => {
     const props = node.properties;
-    if (props && typeof props === 'object' && !Array.isArray(props)) {
-      if (!Array.isArray(node.required)) node.required = [];
-      for (const key of Object.keys(props)) {
-        if (!node.required.includes(key)) { node.required.push(key); completed++; }
-      }
+    if (!props || typeof props !== 'object' || Array.isArray(props)) return null;
+    if (!Array.isArray(node.required)) node.required = [];
+    for (const key of Object.keys(props)) {
+      if (!node.required.includes(key)) { node.required.push(key); completed++; }
     }
-    for (const [key, value] of Object.entries(node)) {
-      if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) continue;
-      cover(value);
-    }
-  };
-  cover(format.schema);
+    return null;
+  });
   if (completed) debugLog({ event: 'required_completed', fields: completed });
   return body;
 }

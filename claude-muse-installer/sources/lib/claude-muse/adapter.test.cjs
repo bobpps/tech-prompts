@@ -798,6 +798,28 @@ test('a missing or short required is completed at every level, and nothing else 
   assert.deepEqual(completeRequired(null), null);
 });
 
+test('a property named like a keyword is still traversed as a map', () => {
+  // The walk cannot filter by key name before it knows what the key names. A
+  // subschema under a property literally called `default` is a schema like any
+  // other: skipping it leaves its short `required` in place and the provider
+  // refuses the request. Worse, a property literally called `properties` makes
+  // the map itself look like a schema, and a naive walk inserts a `required`
+  // array into that map, corrupting the property definition.
+  const body = completeRequired({ output_config: { format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: {
+      default: { type: 'object', properties: { x: { type: 'string' }, y: { type: 'number' } }, required: ['x'] },
+      properties: { type: 'object', properties: { a: { type: 'string' } }, required: [] },
+    },
+    required: ['default', 'properties'],
+  } } } });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.properties.default.required, ['x', 'y']);
+  assert.deepEqual(schema.properties.properties.required, ['a']);
+  // The maps themselves are not schemas: no `required` is inserted into them.
+  assert.ok(!('required' in schema.properties));
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });

@@ -1314,10 +1314,13 @@ function stopSequences(body) {
 //
 // Nested objects are completed too. The provider judges the whole schema, not
 // just its top level, and a nested `properties` with its own short `required`
-// would fail the same way one turn later if only the top level were fixed.
-// Members that hold values rather than schemas - `const`, `default`, `enum`
-// and the rest - are not descended into, for the same reason `portableSchemas`
-// leaves them alone: a member named `properties` inside one of them is data
+// would fail the same way one turn later if only the top level were fixed. The
+// walk reuses the same map-aware traversal as `portableSchemas`: a subschema
+// under a property literally called `default` is visited through the map, and
+// a map itself is never mistaken for a schema, so a property literally called
+// `properties` does not gain a `required` array of its own. Members that hold
+// values rather than schemas - `const`, `default`, `enum` and the rest - are
+// not descended into: a member named `properties` inside one of them is data
 // the model receives, not a schema the provider compiles.
 //
 // Completions are counted into the debug log, so a future caller whose parser
@@ -1327,25 +1330,15 @@ function completeRequired(body) {
   const format = body && typeof body === 'object' && body.output_config && body.output_config.format;
   if (!format || typeof format !== 'object' || format.type !== 'json_schema') return body;
   let completed = 0;
-  const cover = node => {
-    if (!node || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      for (const item of node) cover(item);
-      return;
-    }
+  eachSchema(format.schema, node => {
     const props = node.properties;
-    if (props && typeof props === 'object' && !Array.isArray(props)) {
-      if (!Array.isArray(node.required)) node.required = [];
-      for (const key of Object.keys(props)) {
-        if (!node.required.includes(key)) { node.required.push(key); completed++; }
-      }
+    if (!props || typeof props !== 'object' || Array.isArray(props)) return null;
+    if (!Array.isArray(node.required)) node.required = [];
+    for (const key of Object.keys(props)) {
+      if (!node.required.includes(key)) { node.required.push(key); completed++; }
     }
-    for (const [key, value] of Object.entries(node)) {
-      if (SCHEMA_VALUES.includes(key) || EXTENSION_KEY.test(key)) continue;
-      cover(value);
-    }
-  };
-  cover(format.schema);
+    return null;
+  });
   if (completed) debugLog({ event: 'required_completed', fields: completed });
   return body;
 }
@@ -2725,6 +2718,28 @@ test('a missing or short required is completed at every level, and nothing else 
   assert.deepEqual(completeRequired(null), null);
 });
 
+test('a property named like a keyword is still traversed as a map', () => {
+  // The walk cannot filter by key name before it knows what the key names. A
+  // subschema under a property literally called `default` is a schema like any
+  // other: skipping it leaves its short `required` in place and the provider
+  // refuses the request. Worse, a property literally called `properties` makes
+  // the map itself look like a schema, and a naive walk inserts a `required`
+  // array into that map, corrupting the property definition.
+  const body = completeRequired({ output_config: { format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: {
+      default: { type: 'object', properties: { x: { type: 'string' }, y: { type: 'number' } }, required: ['x'] },
+      properties: { type: 'object', properties: { a: { type: 'string' } }, required: [] },
+    },
+    required: ['default', 'properties'],
+  } } } });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.properties.default.required, ['x', 'y']);
+  assert.deepEqual(schema.properties.properties.required, ['a']);
+  // The maps themselves are not schemas: no `required` is inserted into them.
+  assert.ok(!('required' in schema.properties));
+});
+
 test('a body with no tools, and a tool with no schema, do not throw', () => {
   assert.deepEqual(portableSchemas({}), {});
   assert.deepEqual(portableSchemas({ tools: [] }), { tools: [] });
@@ -3314,8 +3329,8 @@ The `icacls` output is informational only. Do not change it. Report what it
 shows, and restate that the key file is protected only by the user profile's
 inherited rights.
 
-There are fifty-one offline tests in total: thirty-four in
-`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All fifty-one must
+There are fifty-two offline tests in total: thirty-five in
+`adapter.test.cjs` and seventeen in `launcher.test.cjs`. All fifty-two must
 pass on both platforms;
 six of them exercise the Windows program-resolution logic against realistic npm
 shims and run correctly on POSIX as well. Report the count you actually observed.
