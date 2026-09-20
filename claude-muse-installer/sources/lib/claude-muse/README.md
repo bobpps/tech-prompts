@@ -114,6 +114,31 @@ boolean `true` and an environment variable is always a string. This is a
 stopgap: it gives up a working feature to route around one bad pattern, and the
 transform above is what closes the class.
 
+## Structured-output schemas must name every property in `required`
+
+Claude Code's own evaluators answer in JSON: the Stop-hook evaluator, the
+session-title generator, the branch-name proposer. Those calls carry
+`output_config.format`, a JSON schema for the reply, and Meta requires its
+`required` to name every key in `properties`. The evaluator declares
+`impossible` as an optional third property beside a `required` of two, so
+every evaluation of a prompt Stop hook fails - not the turn, which carries no
+output schema, but the call that judges whether the session may end. The
+symptom is a hook error at every stop, never a dead model, and the hook never
+judges: the session either runs on unconditionally or loops on a condition
+that was actually met.
+
+The repair runs the other way from the one for `pattern`. A constraint that
+cannot be compiled is removed, but an optional property cannot be dropped,
+because dropping `impossible` would take the `impossible: true` verdict with
+it - the one outcome that lets the session stop. The adapter adds the missing
+keys to `required` instead, at every level of the schema. That narrowing costs
+nothing at the callers that set this field: they are the CLI's own evaluators,
+whose parsers read an explicit false exactly as they read an absent field, so
+forcing the key present changes what is written and never what is decided.
+Completions are counted into the request log, so a future caller whose parser
+does distinguish the two shows up as a log line rather than only as a hook
+that stopped judging.
+
 ## Auto mode
 
 Claude Code's auto mode asks the model whether a tool call is safe before

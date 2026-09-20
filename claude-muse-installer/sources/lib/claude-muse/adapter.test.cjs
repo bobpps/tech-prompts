@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
+const { ToolNames, sseFrame, sseError, startProxy, plainCacheControl, webSearchTools, portableSchemas, completeRequired, stopSequences, UnsupportedRequest, errorSummary, parseJson, mediaType } = require('./adapter.cjs');
 const long = 'mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message';
 
 test('long names round-trip without changing inputs or schemas', () => {
@@ -745,6 +745,79 @@ test('a patternProperties entry sealed by unevaluatedProperties is refused', () 
     patternProperties: { '^\\p{L}+$': { type: 'string' } },
   } }] });
   assert.deepEqual(open.tools[0].input_schema.patternProperties, {});
+});
+
+test('an output schema names every property it declares in required', () => {
+  // What the Stop-hook evaluator sends, taken off the wire: a structured-output
+  // schema with three properties and a `required` of two. The provider refuses
+  // the whole request for the missing third key, so the hook never judges and
+  // every stop ends in a hook error instead of a verdict.
+  const evaluator = () => ({ output_config: { effort: 'high', format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: { ok: { type: 'boolean' }, reason: { type: 'string' }, impossible: { type: 'boolean' } },
+    required: ['ok', 'reason'],
+    additionalProperties: false,
+  } } } });
+  const body = completeRequired({ tools: [], ...evaluator() });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.required, ['ok', 'reason', 'impossible']);
+  // The completion changes what the model must write, never what the caller
+  // decides: the evaluator treats an explicit false exactly as an absent field.
+  // Everything else on the request - the effort the provider does accept, the
+  // property types, the closed shape - leaves exactly as it arrived.
+  assert.equal(body.output_config.effort, 'high');
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.properties.impossible, { type: 'boolean' });
+});
+
+test('a missing or short required is completed at every level, and nothing else is', () => {
+  // A schema with no `required` at all is refused the same way as one that is
+  // short, and the provider judges the whole schema, so a nested object with
+  // its own short `required` would fail one turn later if only the top level
+  // were fixed.
+  const body = completeRequired({ output_config: { format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      nested: { type: 'object', properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a'] },
+    },
+  } } } });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.required, ['title', 'nested']);
+  assert.deepEqual(schema.properties.nested.required, ['a', 'b']);
+  // A schema that already names everything, a format that is not a JSON schema,
+  // and a request with no output schema at all pass through untouched.
+  const covered = { output_config: { format: { type: 'json_schema', schema: {
+    type: 'object', properties: { a: { type: 'string' } }, required: ['a'],
+  } } } };
+  assert.deepEqual(completeRequired(covered), covered);
+  const other = { output_config: { format: { type: 'text' } } };
+  assert.deepEqual(completeRequired(other), other);
+  assert.deepEqual(completeRequired({ tools: [] }), { tools: [] });
+  assert.deepEqual(completeRequired({}), {});
+  assert.deepEqual(completeRequired(null), null);
+});
+
+test('a property named like a keyword is still traversed as a map', () => {
+  // The walk cannot filter by key name before it knows what the key names. A
+  // subschema under a property literally called `default` is a schema like any
+  // other: skipping it leaves its short `required` in place and the provider
+  // refuses the request. Worse, a property literally called `properties` makes
+  // the map itself look like a schema, and a naive walk inserts a `required`
+  // array into that map, corrupting the property definition.
+  const body = completeRequired({ output_config: { format: { type: 'json_schema', schema: {
+    type: 'object',
+    properties: {
+      default: { type: 'object', properties: { x: { type: 'string' }, y: { type: 'number' } }, required: ['x'] },
+      properties: { type: 'object', properties: { a: { type: 'string' } }, required: [] },
+    },
+    required: ['default', 'properties'],
+  } } } });
+  const schema = body.output_config.format.schema;
+  assert.deepEqual(schema.properties.default.required, ['x', 'y']);
+  assert.deepEqual(schema.properties.properties.required, ['a']);
+  // The maps themselves are not schemas: no `required` is inserted into them.
+  assert.ok(!('required' in schema.properties));
 });
 
 test('a body with no tools, and a tool with no schema, do not throw', () => {
